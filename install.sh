@@ -84,15 +84,70 @@ install_prereqs_apt() {
     export DEBIAN_FRONTEND=noninteractive
     log "Refreshing apt package lists..."
     $SUDO apt-get update -y
-    log "Installing prerequisites: zeek, python3..."
-    $SUDO apt-get install -y zeek python3 ca-certificates curl
-    # Ubuntu/Debian ship Zeek under /opt/zeek/bin, wired into PATH only for
-    # *new* login shells — extend PATH for this session.
-    if ! command -v zeek >/dev/null && [ -x /opt/zeek/bin/zeek ]; then
-        export PATH="/opt/zeek/bin:$PATH"
-    fi
-    command -v zeek >/dev/null || die "Zeek still not found after installation. Install it manually: https://zeek.org/get-zeek/"
+
+    ARCH="$(dpkg --print-architecture 2>/dev/null || uname -m)"
+    case "$ARCH" in
+        amd64|x86_64)
+            # Zeek is not in Ubuntu's own archives. On amd64, use the Zeek
+            # project's official OBS repository (per docs.zeek.org/install).
+            local dist
+            case "${ID:-}" in
+                ubuntu|pop) dist="xUbuntu_${VERSION_ID}" ;;
+                debian)     dist="Debian_${VERSION_ID%%.*}" ;;
+                *) die "No Zeek apt repository for '${ID:-unknown}'. Install Zeek from https://zeek.org/get-zeek/ and re-run." ;;
+            esac
+            command -v gpg >/dev/null || $SUDO apt-get install -y gnupg
+            log "Adding official Zeek package repository (${dist})..."
+            echo "deb https://download.opensuse.org/repositories/security:/zeek/${dist}/ /" \
+                | $SUDO tee /etc/apt/sources.list.d/security:zeek.list > /dev/null
+            curl -fsSL "https://download.opensuse.org/repositories/security:zeek/${dist}/Release.key" \
+                | gpg --dearmor | $SUDO tee /etc/apt/trusted.gpg.d/security_zeek.gpg > /dev/null
+            $SUDO apt-get update -y
+            log "Installing prerequisites: zeek-8.0, python3..."
+            $SUDO apt-get install -y zeek-8.0 python3 ca-certificates curl
+            # OBS packages install under /opt/zeek, on PATH only for new shells.
+            if ! command -v zeek >/dev/null; then
+                for d in /opt/zeek*/bin; do
+                    if [ -x "$d/zeek" ]; then export PATH="$d:$PATH"; break; fi
+                done
+            fi
+            command -v zeek >/dev/null || die "Zeek still not found after installation."
+            ;;
+        *)
+            # The OBS repository publishes no arm64 packages. Use the official
+            # multi-arch Zeek Docker image instead; Wirewatch runs in attach
+            # mode tailing the container's logs (see run_docker_mode).
+            if ! command -v docker >/dev/null; then
+                log "Installing Docker (docker.io)..."
+                $SUDO apt-get install -y docker.io
+            fi
+            docker info >/dev/null 2>&1 || { $SUDO systemctl start docker 2>/dev/null || true; }
+            docker info >/dev/null 2>&1 || die "Docker is installed but not usable — ensure your user can run docker (e.g. 'sudo usermod -aG docker $USER', then log out and back in) and re-run."
+            DOCKER_MODE=1
+            log "Installing python3..."
+            $SUDO apt-get install -y python3 ca-certificates curl
+            ;;
+    esac
 }
+
+run_docker_mode() {
+    local logdir="$INSTALL_DIR/logs"
+    mkdir -p "$logdir"
+    docker rm -f wirewatch-zeek > /dev/null 2>&1 || true
+    log "Pulling the official Zeek image (zeek/zeek:lts, first run only)..."
+    docker run -d --name wirewatch-zeek --net=host \
+        --cap-add=NET_RAW --cap-add=NET_ADMIN \
+        -v "$logdir":/workdir -w /workdir \
+        zeek/zeek:lts zeek -i "$IFACE" > /dev/null \
+        || die "Couldn't start the Zeek container."
+    trap 'docker rm -f wirewatch-zeek > /dev/null 2>&1' EXIT
+    if [ -t 1 ]; then
+        exec python3 "$INSTALL_DIR/wirewatch.py" --attach-only --dir "$logdir" "$@" < /dev/tty
+    fi
+    exec python3 "$INSTALL_DIR/wirewatch.py" --attach-only --dir "$logdir" "$@"
+}
+
+DOCKER_MODE=0
 
 log "Detected OS: $OS ($PKG packaging)"
 
@@ -132,13 +187,18 @@ curl -fsSL "$BASE_URL/wirewatch.py" -o "$INSTALL_DIR/wirewatch.py"
 IFACE="$(detect_iface)"
 ok "Active network interface detected: $IFACE"
 
+if [ "$DOCKER_MODE" = "1" ]; then
+    log "Starting Wirewatch in Docker mode — Zeek runs in a container, Wirewatch tails its logs. Press Ctrl+C to stop."
+    run_docker_mode "$@"
+fi
+
 log "Starting Wirewatch on '$IFACE' — press Ctrl+C to stop. You may be prompted for your sudo password."
 
 # The final launch gets terminal stdin explicitly. When piped
 # (`curl ... | bash`), the script's stdin is the network stream, and sudo
 # inside wirewatch.py prompts on /dev/tty regardless — but Python's stdin
 # should be your terminal so Ctrl+C and any interactive prompt behave.
-if [ -r /dev/tty ]; then
+if [ -t 1 ]; then
     exec python3 "$INSTALL_DIR/wirewatch.py" -i "$IFACE" "$@" < /dev/tty
 else
     exec python3 "$INSTALL_DIR/wirewatch.py" -i "$IFACE" "$@"

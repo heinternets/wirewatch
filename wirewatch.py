@@ -741,7 +741,10 @@ def ensure_zeek(no_install=False):
     try:
         subprocess.run(install_cmd, check=True)
     except subprocess.CalledProcessError:
-        print(f"{C_NOTICE}[!] Zeek installation failed. Install it manually and re-run.{C_RESET}")
+        print(f"{C_NOTICE}[!] Zeek installation failed. Zeek is not in Ubuntu's own archives —{C_RESET}")
+        print(f"    run the Wirewatch installer ({C_DOMAIN}https://wirewatch.net{C_RESET}), which wires up")
+        print(f"    the official package repo (amd64) or the Docker image (arm64), or see")
+        print(f"    {C_DOMAIN}https://zeek.org/get-zeek/{C_RESET}.")
         return False
 
     # Debian/Ubuntu package Zeek under /opt/zeek/bin, wired into PATH only
