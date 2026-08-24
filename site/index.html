@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Wirewatch — one-command Zeek network monitor</title>
+<meta name="description" content="Install and run Wirewatch with a single command: installs Zeek, detects your network interface, and streams enriched, color-coded network activity in your terminal.">
+<style>
+  :root {
+    --bg: #0b0f14;
+    --panel: #11161d;
+    --border: #1e2630;
+    --text: #d7dee7;
+    --muted: #8a97a6;
+    --accent: #4ade80;
+    --cyan: #67e8f9;
+    font-size: 16px;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+    line-height: 1.6;
+  }
+  .wrap { max-width: 860px; margin: 0 auto; padding: 3rem 1.25rem 5rem; }
+  h1 { font-size: clamp(1.6rem, 4vw, 2.4rem); margin: 0 0 .25rem; letter-spacing: -0.02em; }
+  h1 .cursor { color: var(--accent); animation: blink 1.2s steps(1) infinite; }
+  @keyframes blink { 50% { opacity: 0; } }
+  .tagline { color: var(--muted); margin: 0 0 2.5rem; }
+  .cmd {
+    display: flex; align-items: stretch; gap: 0;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    overflow: hidden;
+  }
+  .cmd code {
+    flex: 1;
+    padding: 1rem 1.15rem;
+    color: var(--accent);
+    font-size: clamp(.85rem, 2.6vw, 1rem);
+    white-space: nowrap;
+    overflow-x: auto;
+  }
+  .cmd code .prompt { color: var(--muted); user-select: none; }
+  .cmd button {
+    border: none; cursor: pointer;
+    background: var(--accent); color: #052e16;
+    font: inherit; font-weight: 700;
+    padding: 0 1.4rem;
+  }
+  .cmd button:hover { filter: brightness(1.08); }
+  .cmd button.copied { background: var(--cyan); }
+  section { margin-top: 2.75rem; }
+  h2 { font-size: 1.05rem; color: var(--cyan); margin: 0 0 .9rem; }
+  ol, ul { padding-left: 1.35rem; margin: 0; }
+  li { margin-bottom: .55rem; }
+  li b { color: var(--text); }
+  .muted { color: var(--muted); }
+  .note {
+    margin-top: 2.75rem; padding: 1rem 1.15rem;
+    border-left: 3px solid var(--accent);
+    background: var(--panel);
+    border-radius: 0 10px 10px 0;
+    font-size: .92rem;
+  }
+  footer { margin-top: 4rem; font-size: .85rem; color: var(--muted); }
+  a { color: var(--cyan); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>wirewatch<span class="cursor">_</span></h1>
+  <p class="tagline">One command. Live, enriched, color-coded visibility of everything talking on your network — powered by Zeek.</p>
+
+  <div class="cmd">
+    <code><span class="prompt">$ </span>curl -fsSL https://wirewatch.net/install.sh | bash</code>
+    <button id="copy" type="button">Copy</button>
+  </div>
+
+  <section>
+    <h2>What happens when you run it</h2>
+    <ol>
+      <li><b>Detects your OS</b> — macOS (Homebrew) or Debian-family Linux (apt).</li>
+      <li><b>Installs prerequisites</b> if missing: Homebrew/apt, Python&nbsp;3, and Zeek.</li>
+      <li><b>Downloads the latest wirewatch.py</b> from this site.</li>
+      <li><b>Detects your active network interface</b> (your default route) automatically.</li>
+      <li><b>Starts the capture</b> — you'll be asked for your sudo password once, then live traffic streams into your terminal.</li>
+    </ol>
+  </section>
+
+  <section>
+    <h2>You'll see</h2>
+    <ul>
+      <li><b>DNS queries</b>, TLS SNI names, HTTP requests, SSH, DHCP, NTP, file transfers</li>
+      <li>Raw IPs <b>cross-referenced with domains</b> seen on the wire in real time</li>
+      <li>Zeek <b>notice alerts</b> highlighted, protocol anomalies deduplicated</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>Requirements</h2>
+    <ul>
+      <li>macOS (Apple Silicon or Intel), or Ubuntu/Debian-family Linux</li>
+      <li>A terminal and an internet connection</li>
+      <li>Sudo access — packet capture needs it (this is standard for any sniffer, Zeek included)</li>
+    </ul>
+  </section>
+
+  <div class="note">
+    Prefer to read before you run? The installer is a single plain shell script and
+    Wirewatch itself is a single plain Python file. Review either one:
+    <a href="/install.sh">install.sh</a> &middot; <a href="/wirewatch.py">wirewatch.py</a> &middot;
+    source on <a href="https://github.com/heinternets/wirewatch">GitHub</a>.
+    Stop anytime with Ctrl+C.
+  </div>
+
+  <footer>
+    Wirewatch runs <code>zeek</code> locally on your machine. No data leaves your computer.
+  </footer>
+</div>
+
+<script>
+const btn = document.getElementById('copy');
+btn.addEventListener('click', async () => {
+  try {
+    await navigator.clipboard.writeText('curl -fsSL https://wirewatch.net/install.sh | bash');
+    btn.textContent = 'Copied!';
+    btn.classList.add('copied');
+    setTimeout(() => { btn.textContent = 'Copy'; btn.classList.remove('copied'); }, 1600);
+  } catch (_) {
+    // clipboard blocked (non-secure context) — select the command instead
+    const range = document.createRange();
+    range.selectNodeContents(btn.previousElementSibling);
+    const sel = getSelection(); sel.removeAllRanges(); sel.addRange(range);
+  }
+});
+</script>
+</body>
+</html>
