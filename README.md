@@ -76,11 +76,13 @@ Static Web Apps that serves `index.html`, `install.sh`, and `wirewatch.py` strai
 repository (staged by `.github/workflows/deploy.yml` on every push to `main`). The scripts are
 always the latest committed version — no manual uploads.
 
-Why the one-liner is `curl ... | bash` rather than `curl ... | python3`: the installer script
-reattaches stdin to `/dev/tty` before anything needs a password prompt, so `sudo` still talks to
-your terminal even though bash itself was piped a network stream. Piping straight into a Python
-interpreter would leave no terminal stdin at all for the same reason — which is why the installer
-downloads `wirewatch.py` first and then runs it as its own process.
+Why the one-liner is `curl ... | bash` rather than `curl ... | python3`: piping an interpreter
+a script means its stdin is the network stream, not your terminal. The installer downloads
+`wirewatch.py` and runs it as a separate process with terminal stdin attached (`< /dev/tty`),
+while `sudo` — which always prompts on the controlling terminal, never on stdin — handles the
+password prompt itself. A global `exec 0</dev/tty` inside the installer is NOT an option:
+bash reads the piped script source from stdin, so redirecting fd 0 mid-script makes bash try
+to read the rest of the script from your keyboard (it hangs silently).
 
 ### Deploying the site
 

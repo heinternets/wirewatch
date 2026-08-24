@@ -25,11 +25,6 @@ die()  { printf '\033[1;41;97m[!] FATAL:\033[0m %s\n' "$*" >&2; exit 1; }
 command -v curl >/dev/null || die "curl is required but was not found."
 command -v python3 >/dev/null || warn "python3 not found yet — will be installed with the prerequisites."
 
-# When piped (`curl ... | bash`), stdin is the network stream. Reattach it to
-# the terminal so sudo/password prompts and Ctrl+C behave normally.
-if [ ! -t 0 ] && [ -r /dev/tty ]; then
-    exec 0</dev/tty
-fi
 
 SUDO=""
 if [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null; then
@@ -138,4 +133,13 @@ IFACE="$(detect_iface)"
 ok "Active network interface detected: $IFACE"
 
 log "Starting Wirewatch on '$IFACE' — press Ctrl+C to stop. You may be prompted for your sudo password."
-exec python3 "$INSTALL_DIR/wirewatch.py" -i "$IFACE" "$@"
+
+# The final launch gets terminal stdin explicitly. When piped
+# (`curl ... | bash`), the script's stdin is the network stream, and sudo
+# inside wirewatch.py prompts on /dev/tty regardless — but Python's stdin
+# should be your terminal so Ctrl+C and any interactive prompt behave.
+if [ -r /dev/tty ]; then
+    exec python3 "$INSTALL_DIR/wirewatch.py" -i "$IFACE" "$@" < /dev/tty
+else
+    exec python3 "$INSTALL_DIR/wirewatch.py" -i "$IFACE" "$@"
+fi
