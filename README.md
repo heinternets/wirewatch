@@ -57,6 +57,10 @@ python3 wirewatch.py [options]
   --attach-only         Don't launch Zeek — just watch --dir for logs from a Zeek process you
                         started yourself (this was the old default behavior)
   --no-install          Don't try to auto-install Zeek if it's missing
+  --match TEXT         Only show lines containing this substring (case-insensitive)
+  --min-bytes N        Hide CONN rows with fewer than N bytes transferred (orig+resp)
+  --min-duration S     Hide CONN rows shorter than S seconds
+  --hide-lan           Suppress unnamed LAN/mDNS/local traffic
 ```
 
 Examples:
@@ -67,6 +71,8 @@ python3 wirewatch.py --only dns,http,ssl        # just web + DNS traffic
 python3 wirewatch.py --exclude ntp,dhcp         # hide the noisy background chatter
 python3 wirewatch.py --pcap sample.pcap         # analyze a capture file, no sudo required
 python3 wirewatch.py --attach-only --dir ~/logs # tail logs from an existing zeekctl deployment
+python3 wirewatch.py --match example.com          # only lines mentioning a domain
+python3 wirewatch.py --hide-lan --min-bytes 10000 # real remote traffic only
 ```
 
 ## Distribution & hosting notes

@@ -44,6 +44,7 @@ C_SSH     = "\033[1;38;5;120m"# Mint Green
 C_DHCP    = "\033[1;38;5;177m"# Lavender / Violet
 C_SOFTWR  = "\033[1;38;5;153m"# Ice Blue
 C_X509    = "\033[1;38;5;141m"# Light Purple
+C_QUIC    = "\033[1;38;5;215m"# Light Orange — QUIC/HTTP3
 C_DPD     = "\033[1;31m"      # Bright Red
 C_KNOWN   = "\033[1;38;5;114m"# Soft Green
 C_OTHER   = "\033[1;37m"      # Bright White
@@ -61,13 +62,13 @@ def configure_colors(enabled):
     NO_COLOR env var, or non-tty stdout) instead of threading a flag through
     every print call."""
     global C_TIME, C_DNS, C_SSL, C_HTTP, C_CONN, C_NOTICE, C_FILES, C_WEIRD
-    global C_NTP, C_SSH, C_DHCP, C_SOFTWR, C_X509, C_DPD, C_KNOWN, C_OTHER
+    global C_NTP, C_SSH, C_DHCP, C_SOFTWR, C_X509, C_QUIC, C_DPD, C_KNOWN, C_OTHER
     global C_DOMAIN, C_META, C_RESET
     if enabled:
         return
     (C_TIME, C_DNS, C_SSL, C_HTTP, C_CONN, C_NOTICE, C_FILES, C_WEIRD,
-     C_NTP, C_SSH, C_DHCP, C_SOFTWR, C_X509, C_DPD, C_KNOWN, C_OTHER,
-     C_DOMAIN, C_META, C_RESET) = [""] * 19
+     C_NTP, C_SSH, C_DHCP, C_SOFTWR, C_X509, C_QUIC, C_DPD, C_KNOWN, C_OTHER,
+     C_DOMAIN, C_META, C_RESET) = [""] * 20
 
 
 def resolve_color_setting(cli_no_color):
@@ -98,6 +99,40 @@ def type_allowed(log_type):
     if lt in EXCLUDE_TYPES:
         return False
     return True
+
+
+# --- Display filters (--match / --min-bytes / --min-duration / --hide-lan) ---
+MATCH_TEXT = None    # case-insensitive substring every printed line must contain
+MIN_BYTES = 0        # CONN rows below this total byte count are hidden
+MIN_DURATION = 0.0   # CONN rows shorter than this many seconds are hidden
+HIDE_LAN = False     # suppress unnamed local-network traffic
+
+
+def apply_display_filters(args):
+    global MATCH_TEXT, MIN_BYTES, MIN_DURATION, HIDE_LAN
+    if args.match:
+        MATCH_TEXT = args.match
+    try:
+        MIN_BYTES = int(args.min_bytes)
+    except (TypeError, ValueError):
+        MIN_BYTES = 0
+    try:
+        MIN_DURATION = float(args.min_duration)
+    except (TypeError, ValueError):
+        MIN_DURATION = 0.0
+    HIDE_LAN = bool(args.hide_lan)
+
+
+def is_unnamed_local(ip_str):
+    """True for private/loopback/link-local/multicast IPs that have no cached
+    name (no DNS/SNI/DHCP hostname seen for them yet)."""
+    try:
+        ip = ipaddress.ip_address(ip_str)
+    except ValueError:
+        return False
+    if not (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast):
+        return False
+    return cache_get(ip_str) is None
 
 
 # --- DNS/SNI resolution cache (bounded, LRU) ---
@@ -131,6 +166,31 @@ def cache_get(ip):
         if domain is not None:
             DNS_CACHE.move_to_end(ip)
         return domain
+
+
+# Leaf-certificate CN fallback keyed by cert fingerprint (bounded, LRU).
+# Lets ssl.log rows without SNI show something real; best-effort by design.
+X509_CN_BY_FP = OrderedDict()
+X509_CN_MAX = 5000
+
+
+def x509_cn_put(fp, cn):
+    if not fp or fp == "-" or not cn or cn == "-":
+        return
+    with CACHE_LOCK:
+        if fp in X509_CN_BY_FP:
+            X509_CN_BY_FP.move_to_end(fp)
+        X509_CN_BY_FP[fp] = cn
+        while len(X509_CN_BY_FP) > X509_CN_MAX:
+            X509_CN_BY_FP.popitem(last=False)
+
+
+def x509_cn_get(fp):
+    with CACHE_LOCK:
+        cn = X509_CN_BY_FP.get(fp)
+        if cn is not None:
+            X509_CN_BY_FP.move_to_end(fp)
+        return cn
 
 
 @lru_cache(maxsize=4096)
@@ -239,6 +299,16 @@ def safe_print(msg):
         sys.stdout.flush()
 
 
+def emit(log_type, msg):
+    """Filtered print for parsed log rows: --only/--exclude gate visibility
+    here instead of in process_row, so every row still reaches its parser
+    and enrichment caches keep filling under any filter."""
+    if MATCH_TEXT is not None and MATCH_TEXT.lower() not in ANSI_RE.sub("", msg).lower():
+        return
+    if type_allowed(log_type):
+        safe_print(msg)
+
+
 # --- Dropped/malformed line tracking ---
 DROPPED_COUNTS = defaultdict(int)
 DROPPED_LOCK = threading.Lock()
@@ -296,6 +366,10 @@ def parse_dns(row):
                 except ValueError:
                     continue
                 cache_put(ans, query)
+    # Under --hide-lan, mDNS (.local) queries are the dominant noise source:
+    # keep feeding the answer->query cache above, but don't print the line.
+    if HIDE_LAN and query != "-" and query.lower().endswith(".local"):
+        return
 
     ts = get_time(row.get("ts"))
 
@@ -312,7 +386,7 @@ def parse_dns(row):
             more = len(clean) - len(shown)
             ans_str = ", ".join(shown) + (f" (+{more} more)" if more else "")
 
-    safe_print(f"{C_TIME}{ts}{C_RESET} {C_DNS}[DNS   ]{C_RESET} {orig_h:<15} asked [{C_META}{qtype:<4}{C_RESET}] {C_DOMAIN}{query:<35}{C_RESET} -> {ans_str}")
+    emit("dns", f"{C_TIME}{ts}{C_RESET} {C_DNS}[DNS   ]{C_RESET} {orig_h:<15} asked [{C_META}{qtype:<4}{C_RESET}] {C_DOMAIN}{query:<35}{C_RESET} -> {ans_str}")
 
 def parse_ssl(row):
     server = row.get("server_name", "-")
@@ -324,8 +398,20 @@ def parse_ssl(row):
     if server != "-" and resp_h != "-":
         cache_put(resp_h, server)
 
+    server_disp = server
+    if server == "-":
+        # No SNI (e.g. local/mDNS TLS): fall back to the leaf certificate CN
+        # via x509.log, best-effort — that row may land after this one, in
+        # which case the plain '-' stands (no retry/reprint).
+        fps = row.get("cert_chain_fps", "") or ""
+        fp = fps.split(",")[0].strip()
+        cn = x509_cn_get(fp) if fp and fp != "-" else None
+        if cn:
+            server_disp = f"cert:{cn}"
+
     ts = get_time(row.get("ts"))
-    safe_print(f"{C_TIME}{ts}{C_RESET} {C_SSL}[SSL/TLS]{C_RESET} {orig_h:<15} -> {resp_h}:{resp_p} ({C_DOMAIN}{server:<30}{C_RESET}) [{C_META}{version}{C_RESET}]")
+    emit("ssl", f"{C_TIME}{ts}{C_RESET} {C_SSL}[SSL/TLS]{C_RESET} {orig_h:<15} -> {resp_h}:{resp_p} ({C_DOMAIN}{server_disp:<30}{C_RESET}) [{C_META}{version}{C_RESET}]")
+
 
 def parse_http(row):
     method = row.get("method", "-")
@@ -339,7 +425,25 @@ def parse_http(row):
         cache_put(resp_h, host)
 
     ts = get_time(row.get("ts"))
-    safe_print(f"{C_TIME}{ts}{C_RESET} {C_HTTP}[HTTP  ]{C_RESET} {orig_h:<15} {C_META}{method:<5}{C_RESET} http://{host}{uri[:40]} [{status}]")
+    emit("http", f"{C_TIME}{ts}{C_RESET} {C_HTTP}[HTTP  ]{C_RESET} {orig_h:<15} {C_META}{method:<5}{C_RESET} http://{host}{uri[:40]} [{status}]")
+
+def parse_quic(row):
+    orig_h = row.get("id.orig_h", "-")
+    orig_p = row.get("id.orig_p", "")
+    resp_h = row.get("id.resp_h", "-")
+    resp_p = row.get("id.resp_p", "443")
+    version = row.get("version", "-")
+    server = row.get("server_name", "-")
+    client_protocol = row.get("client_protocol", "-")
+
+    # QUIC carries most modern traffic; its SNI feeds the IP->domain cache,
+    # which is what fixes bare-IP CONN rows on udp/443.
+    if server != "-" and resp_h != "-":
+        cache_put(resp_h, server)
+
+    ts = get_time(row.get("ts"))
+    src = f"{orig_h}:{orig_p}" if orig_p else orig_h
+    emit("quic", f"{C_TIME}{ts}{C_RESET} {C_QUIC}[QUIC  ]{C_RESET} {src:<15} -> {resp_h}:{resp_p} ({C_DOMAIN}{server:<30}{C_RESET}) [{C_META}v{version} {client_protocol}{C_RESET}]")
 
 # Repeated identical Weird events (same name + destination) within this
 # window are folded into the next line's "+N more" note instead of
@@ -380,7 +484,7 @@ def parse_weird(row):
     detail = f" | Detail: {addl}" if addl and addl != "-" else ""
     repeat_note = (f" {C_TIME}(+{prior_count - 1} more suppressed in prior {int(WEIRD_DEDUP_WINDOW)}s){C_RESET}"
                    if prior_count > 1 else "")
-    safe_print(f"{C_TIME}{ts}{C_RESET} {C_WEIRD}[WEIRD ]{C_RESET} {src_info} -> {dst_info} | {C_WEIRD}{name}{C_RESET}{detail}{repeat_note}")
+    emit("weird", f"{C_TIME}{ts}{C_RESET} {C_WEIRD}[WEIRD ]{C_RESET} {src_info} -> {dst_info} | {C_WEIRD}{name}{C_RESET}{detail}{repeat_note}")
 
 def parse_ntp(row):
     orig_h = row.get("id.orig_h", "-")
@@ -391,7 +495,7 @@ def parse_ntp(row):
 
     domain = resolve_target(resp_h)
     ts = get_time(row.get("ts"))
-    safe_print(f"{C_TIME}{ts}{C_RESET} {C_NTP}[NTP   ]{C_RESET} {orig_h:<15} -> {resp_h:<15} ({C_DOMAIN}{domain:<28}{C_RESET}) [v{version} Stratum:{stratum} Mode:{mode}]")
+    emit("ntp", f"{C_TIME}{ts}{C_RESET} {C_NTP}[NTP   ]{C_RESET} {orig_h:<15} -> {resp_h:<15} ({C_DOMAIN}{domain:<28}{C_RESET}) [v{version} Stratum:{stratum} Mode:{mode}]")
 
 def parse_ssh(row):
     orig_h = row.get("id.orig_h", "-")
@@ -405,7 +509,7 @@ def parse_ssh(row):
     auth_badge = f"{C_CONN}SUCCESS{C_RESET}" if auth_success == "T" else (f"{C_NOTICE}FAILED{C_RESET}" if auth_success == "F" else "-")
 
     ts = get_time(row.get("ts"))
-    safe_print(f"{C_TIME}{ts}{C_RESET} {C_SSH}[SSH   ]{C_RESET} {orig_h}:{orig_p} -> {resp_h}:{resp_p} ({C_DOMAIN}{domain:<25}{C_RESET}) Auth:{auth_badge} | Srv: {server[:25]}")
+    emit("ssh", f"{C_TIME}{ts}{C_RESET} {C_SSH}[SSH   ]{C_RESET} {orig_h}:{orig_p} -> {resp_h}:{resp_p} ({C_DOMAIN}{domain:<25}{C_RESET}) Auth:{auth_badge} | Srv: {server[:25]}")
 
 def parse_dhcp(row):
     client_addr = row.get("client_addr", row.get("assigned_ip", "-"))
@@ -414,8 +518,18 @@ def parse_dhcp(row):
     server_addr = row.get("server_addr", "-")
     msg_types = row.get("msg_types", "-")
 
+    # Lease table feeds the IP->domain cache so LAN peers stop collapsing
+    # to the generic LAN/Local label (resolve_target checks the cache first).
+    if host_name and host_name != "-" and client_addr and client_addr != "-":
+        try:
+            ipaddress.ip_address(client_addr)
+            cache_put(client_addr, host_name)
+        except ValueError:
+            pass
+
     ts = get_time(row.get("ts"))
-    safe_print(f"{C_TIME}{ts}{C_RESET} {C_DHCP}[DHCP  ]{C_RESET} Host: {C_DOMAIN}{host_name}{C_RESET} ({mac}) | IP: {client_addr} | Srv: {server_addr} [{msg_types}]")
+    emit("dhcp", f"{C_TIME}{ts}{C_RESET} {C_DHCP}[DHCP  ]{C_RESET} Host: {C_DOMAIN}{host_name}{C_RESET} ({mac}) | IP: {client_addr} | Srv: {server_addr} [{msg_types}]")
+
 
 def parse_software(row):
     host = row.get("host", "-")
@@ -425,7 +539,7 @@ def parse_software(row):
     domain = resolve_target(host)
 
     ts = get_time(row.get("ts"))
-    safe_print(f"{C_TIME}{ts}{C_RESET} {C_SOFTWR}[SOFTWR]{C_RESET} Host: {host} ({C_DOMAIN}{domain}{C_RESET}) | {software_type}: {C_META}{name}{C_RESET} v{version}")
+    emit("software", f"{C_TIME}{ts}{C_RESET} {C_SOFTWR}[SOFTWR]{C_RESET} Host: {host} ({C_DOMAIN}{domain}{C_RESET}) | {software_type}: {C_META}{name}{C_RESET} v{version}")
 
 def parse_x509(row):
     subject = row.get("certificate.subject", "-")
@@ -439,9 +553,10 @@ def parse_x509(row):
         cn = san_dns.split(",")[0]
     else:
         cn = "-"
-
+    if cn and cn not in ("-", "(empty)"):
+        x509_cn_put(row.get("fingerprint", "-"), cn)
     ts = get_time(row.get("ts"))
-    safe_print(f"{C_TIME}{ts}{C_RESET} {C_X509}[X509  ]{C_RESET} Cert CN: {C_DOMAIN}{cn:<30}{C_RESET} | Issuer: {issuer[:35]}")
+    emit("x509", f"{C_TIME}{ts}{C_RESET} {C_X509}[X509  ]{C_RESET} Cert CN: {C_DOMAIN}{cn:<30}{C_RESET} | Issuer: {issuer[:35]}")
 
 def parse_dpd(row):
     orig_h = row.get("id.orig_h", "-")
@@ -452,7 +567,7 @@ def parse_dpd(row):
     domain = resolve_target(resp_h)
 
     ts = get_time(row.get("ts"))
-    safe_print(f"{C_TIME}{ts}{C_RESET} {C_DPD}[DPD   ]{C_RESET} {orig_h} -> {resp_h} ({C_DOMAIN}{domain}{C_RESET}) | Proto: {proto}/{analyzer} | Fail: {failure_reason}")
+    emit("dpd", f"{C_TIME}{ts}{C_RESET} {C_DPD}[DPD   ]{C_RESET} {orig_h} -> {resp_h} ({C_DOMAIN}{domain}{C_RESET}) | Proto: {proto}/{analyzer} | Fail: {failure_reason}")
 
 def parse_known_services(row):
     host = row.get("host", "-")
@@ -463,7 +578,7 @@ def parse_known_services(row):
     proto_str = f"/{port_proto}" if port_proto and port_proto != "-" else ""
 
     ts = get_time(row.get("ts"))
-    safe_print(f"{C_TIME}{ts}{C_RESET} {C_KNOWN}[KNOWN-SVC]{C_RESET} Host: {host:<15} ({C_DOMAIN}{domain:<28}{C_RESET}) | Service: {port_num}{proto_str}/{svc}")
+    emit("known_services", f"{C_TIME}{ts}{C_RESET} {C_KNOWN}[KNOWN-SVC]{C_RESET} Host: {host:<15} ({C_DOMAIN}{domain:<28}{C_RESET}) | Service: {port_num}{proto_str}/{svc}")
 
 def parse_known_certs(row):
     host = row.get("host", "-")
@@ -476,13 +591,13 @@ def parse_known_certs(row):
     cn = cn_match.group(1) if cn_match else subject[:30]
 
     ts = get_time(row.get("ts"))
-    safe_print(f"{C_TIME}{ts}{C_RESET} {C_KNOWN}[KNOWN-CRT]{C_RESET} Host: {host}:{port_num} ({C_DOMAIN}{domain}{C_RESET}) | CN: {C_DOMAIN}{cn}{C_RESET} | Issuer: {issuer[:35]} | Serial: {serial}")
+    emit("known_certs", f"{C_TIME}{ts}{C_RESET} {C_KNOWN}[KNOWN-CRT]{C_RESET} Host: {host}:{port_num} ({C_DOMAIN}{domain}{C_RESET}) | CN: {C_DOMAIN}{cn}{C_RESET} | Issuer: {issuer[:35]} | Serial: {serial}")
 
 def parse_known_hosts(row):
     host = row.get("host", "-")
     domain = resolve_target(host)
     ts = get_time(row.get("ts"))
-    safe_print(f"{C_TIME}{ts}{C_RESET} {C_KNOWN}[KNOWN-HOST]{C_RESET} {host:<15} ({C_DOMAIN}{domain}{C_RESET})")
+    emit("known_hosts", f"{C_TIME}{ts}{C_RESET} {C_KNOWN}[KNOWN-HOST]{C_RESET} {host:<15} ({C_DOMAIN}{domain}{C_RESET})")
 
 def parse_known_generic(log_type, row):
     host = row.get("host", "-")
@@ -492,7 +607,7 @@ def parse_known_generic(log_type, row):
     detail = f"| Service: {port_num}/{svc}" if svc else ""
 
     ts = get_time(row.get("ts"))
-    safe_print(f"{C_TIME}{ts}{C_RESET} {C_KNOWN}[{log_type.upper():<10}]{C_RESET} Host: {host:<15} ({C_DOMAIN}{domain:<28}{C_RESET}) {detail}")
+    emit(log_type, f"{C_TIME}{ts}{C_RESET} {C_KNOWN}[{log_type.upper():<10}]{C_RESET} Host: {host:<15} ({C_DOMAIN}{domain:<28}{C_RESET}) {detail}")
 
 def parse_notice(row):
     note = row.get("note", "Notice")
@@ -503,7 +618,7 @@ def parse_notice(row):
     dst_info = f"{dst} ({dst_dom})" if dst != "-" else "-"
 
     ts = get_time(row.get("ts"))
-    safe_print(f"{C_TIME}{ts}{C_RESET} {C_NOTICE} [ALERT] {C_RESET} {C_META}{note}{C_RESET} | Src: {src} -> Dst: {dst_info} | {msg}")
+    emit("notice", f"{C_TIME}{ts}{C_RESET} {C_NOTICE} [ALERT] {C_RESET} {C_META}{note}{C_RESET} | Src: {src} -> Dst: {dst_info} | {msg}")
 
 def parse_files(row):
     source = row.get("source", "-")
@@ -520,7 +635,15 @@ def parse_files(row):
         label = f"({mime})"
 
     ts = get_time(row.get("ts"))
-    safe_print(f"{C_TIME}{ts}{C_RESET} {C_FILES}[FILES ]{C_RESET} {C_META}{source:<5}{C_RESET} {label:<45} {size_str}")
+    emit("files", f"{C_TIME}{ts}{C_RESET} {C_FILES}[FILES ]{C_RESET} {C_META}{source:<5}{C_RESET} {label:<45} {size_str}")
+
+# Repeated identical CONN events (same proto + destination) within this
+# window are folded into the next line's "+N more" note instead of
+# flooding the terminal (mDNS/keepalive chatter). Same accepted trade-off
+# as weird.log folding: a burst that never recurs leaves its tally unflushed.
+CONN_DEDUP_WINDOW = 30.0
+_conn_state = {}
+_conn_lock = threading.Lock()
 
 def parse_conn(row):
     proto = row.get("proto", "").upper()
@@ -532,9 +655,35 @@ def parse_conn(row):
     state = row.get("conn_state", "-")
     duration = row.get("duration", "-")
 
-    # Avoid duplicating rows covered by specialized protocol listeners
-    if resp_p in ("53", "5353") or service in ("dns", "ntp"):
+    # Avoid duplicating rows covered by specialized protocol listeners;
+    # QUIC gets its own colored line from quic.log.
+    if resp_p in ("53", "5353") or service in ("dns", "ntp") or "quic" in service:
         return
+
+    # --min-bytes / --min-duration gate before fold bookkeeping so counters
+    # only ever track rows that would have been printable.
+    try:
+        total_bytes = int(row.get("orig_bytes", "0")) + int(row.get("resp_bytes", "0"))
+    except ValueError:
+        total_bytes = 0
+    try:
+        dur_val = float(duration)
+    except ValueError:
+        dur_val = 0.0
+    if total_bytes < MIN_BYTES or dur_val < MIN_DURATION:
+        return
+
+    key = (proto, resp_h, resp_p)
+    now = time.time()
+    prior_count = 0
+    with _conn_lock:
+        st = _conn_state.get(key)
+        if st is not None and (now - st["start"]) < CONN_DEDUP_WINDOW:
+            st["count"] += 1
+            return
+        if st is not None:
+            prior_count = st["count"]
+        _conn_state[key] = {"start": now, "count": 1}
 
     domain = resolve_target(resp_h)
     ts = get_time(row.get("ts"))
@@ -542,8 +691,10 @@ def parse_conn(row):
     dst = f"{resp_h}:{resp_p}"
     svc = service if service != "-" else resp_p
     dur_str = f"{float(duration):.2f}s" if duration != "-" else "-"
+    repeat_note = (f" {C_TIME}(+{prior_count - 1} more suppressed in prior {int(CONN_DEDUP_WINDOW)}s){C_RESET}"
+                   if prior_count > 1 else "")
+    emit("conn", f"{C_TIME}{ts}{C_RESET} {C_CONN}[CONN  ]{C_RESET} {proto:<4} {src:<21} -> {dst:<21} ({C_DOMAIN}{domain:<30}{C_RESET}) [{C_META}{svc:<5}{C_RESET}] {state:<5} {dur_str}{repeat_note}")
 
-    safe_print(f"{C_TIME}{ts}{C_RESET} {C_CONN}[CONN  ]{C_RESET} {proto:<4} {src:<21} -> {dst:<21} ({C_DOMAIN}{domain:<30}{C_RESET}) [{C_META}{svc:<5}{C_RESET}] {state:<5} {dur_str}")
 
 def parse_generic(log_type, row):
     # Enriched fallback for any unexpected Zeek log
@@ -555,15 +706,40 @@ def parse_generic(log_type, row):
         dom = resolve_target(resp)
         target_info = f"[{resp} ({dom})] "
 
-    summary = " | ".join([f"{k}={v}" for k, v in list(row.items())[:3] if k not in ("ts", "uid", "id.orig_h", "id.resp_h", "host") and v != "-"])
-    safe_print(f"{C_TIME}{ts}{C_RESET} {C_OTHER}[{log_type.upper():<6}]{C_RESET} {target_info}{summary}")
+    # uid-ish noise (ports, proto, tunnel bookkeeping) stays out of the
+    # summary now that dedicated parsers cover it; values are capped so a
+    # stray blob can't blow up the line.
+    fields = [
+        f"{k}={str(v)[:40]}"
+        for k, v in row.items()
+        if k not in ("ts", "uid", "id.orig_h", "id.orig_p", "id.resp_h", "id.resp_p", "host", "proto")
+        and v != "-"
+        and not k.startswith("tunnel")
+    ]
+    summary = " | ".join(fields[:3])
+    emit(log_type, f"{C_TIME}{ts}{C_RESET} {C_OTHER}[{log_type.upper():<6}]{C_RESET} {target_info}{summary}")
+
+HIDE_LAN_DST_FIELDS = {
+    # Rows whose DESTINATION being an unnamed local address makes them LAN
+    # chatter under --hide-lan. Enrichment-source types (dns/ssl/http/quic/
+    # dhcp/x509/known_*) are exempt so caches keep filling.
+    "conn": "id.resp_h",
+    "weird": "id.resp_h",
+    "ntp": "id.resp_h",
+    "ssh": "id.resp_h",
+    "dpd": "id.resp_h",
+    "notice": "dst",
+}
 
 def process_row(log_type, row):
-    if not type_allowed(log_type):
-        return
+    if HIDE_LAN:
+        dst_field = HIDE_LAN_DST_FIELDS.get(log_type)
+        if dst_field and is_unnamed_local(row.get(dst_field, "-")):
+            return
     if log_type == "dns": parse_dns(row)
     elif log_type == "ssl": parse_ssl(row)
     elif log_type == "http": parse_http(row)
+    elif log_type == "quic": parse_quic(row)
     elif log_type == "weird": parse_weird(row)
     elif log_type == "ntp": parse_ntp(row)
     elif log_type == "ssh": parse_ssh(row)
@@ -579,6 +755,7 @@ def process_row(log_type, row):
     elif log_type == "files": parse_files(row)
     elif log_type == "conn": parse_conn(row)
     else: parse_generic(log_type, row)
+
 
 # --- Log File Tailing & Discovery ---
 
@@ -859,6 +1036,13 @@ def parse_args():
     p.add_argument("--attach-only", action="store_true",
                     help="Don't launch Zeek — just watch --dir for logs from a Zeek process you start yourself")
     p.add_argument("--no-install", action="store_true", help="Don't auto-install Zeek if it's missing")
+    p.add_argument("--match", help="Only show lines containing this substring (case-insensitive)")
+    p.add_argument("--min-bytes", type=int, default=0, metavar="N",
+                   help="Hide CONN rows with fewer than N bytes transferred (orig+resp)")
+    p.add_argument("--min-duration", type=float, default=0.0, metavar="S",
+                   help="Hide CONN rows shorter than S seconds")
+    p.add_argument("--hide-lan", action="store_true",
+                   help="Suppress unnamed LAN/mDNS/local traffic")
     return p.parse_args()
 
 
@@ -879,6 +1063,7 @@ def main():
     args = parse_args()
     configure_colors(resolve_color_setting(args.no_color))
     apply_filters(args.only, args.exclude)
+    apply_display_filters(args)
 
     work_dir = os.path.abspath(os.path.expanduser(args.dir))
     os.makedirs(work_dir, exist_ok=True)
