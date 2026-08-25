@@ -972,18 +972,15 @@ def launch_zeek(args, work_dir):
         if subprocess.run(["sudo", "-n", "true"]).returncode != 0:
             print(f"{C_NOTICE}[!] Sudo authentication failed or was cancelled. Aborting.{C_RESET}")
             return None
-        # trap "" INT survives exec: Zeek inherits SIGINT=ignore, so a Ctrl+C
-        # delivered to our foreground process group can't kill the capture
-        # out from under us — only stop_zeek's explicit SIGTERM may end it.
-        cmd = ["sudo", "-n", "sh", "-c",
-               f'trap "" INT; exec {shlex.quote(zeek_bin)} -i {shlex.quote(args.iface)}']
+        cmd = ["sudo", "-n", zeek_bin, "-i", args.iface]
     print(f"{C_META}[*] Starting Zeek: {' '.join(cmd)}{C_RESET}")
     # All of Zeek's stdio is redirected (stdin/stdout discarded, stderr to a
     # log file), so the capture can never write to or reconfigure our
     # terminal. It stays in our foreground process group because macOS sudo
     # binds credential tickets to the controlling tty — a detached capture
-    # couldn't reuse the ticket validated by `sudo -v` above. The INT trap in
-    # cmd keeps a shared Ctrl+C from killing Zeek directly.
+    # couldn't reuse the ticket validated by `sudo -v` above. Ctrl+C reaching
+    # Zeek through the shared group is intentional: it ends capture instantly,
+    # and stop_zeek skips sudo entirely when Zeek is already gone.
     console_path = os.path.join(work_dir, "zeek-console.log")
     try:
         proc = subprocess.Popen(cmd, cwd=work_dir, stdin=subprocess.DEVNULL,
@@ -1008,6 +1005,11 @@ def launch_zeek(args, work_dir):
 
 
 def stop_zeek(proc, used_sudo):
+    # The shared foreground group means a terminal Ctrl+C usually already
+    # terminated Zeek (and its sudo wrapper) — skip the password-asking
+    # kill path entirely when nothing is left to stop.
+    if proc.poll() is not None:
+        return
     if used_sudo:
         print(f"{C_META}[*] Stopping Zeek (pid {proc.pid})... you may be asked for your sudo password again.{C_RESET}")
         kill_cmds = [["sudo", "kill", str(proc.pid)], ["sudo", "kill", "-9", str(proc.pid)]]
