@@ -19,6 +19,7 @@ import ipaddress
 import os
 import platform
 import re
+import shlex
 import shutil
 import signal
 import socket
@@ -971,14 +972,18 @@ def launch_zeek(args, work_dir):
         if subprocess.run(["sudo", "-n", "true"]).returncode != 0:
             print(f"{C_NOTICE}[!] Sudo authentication failed or was cancelled. Aborting.{C_RESET}")
             return None
-        cmd = ["sudo", "-n", zeek_bin, "-i", args.iface]
+        # trap "" INT survives exec: Zeek inherits SIGINT=ignore, so a Ctrl+C
+        # delivered to our foreground process group can't kill the capture
+        # out from under us — only stop_zeek's explicit SIGTERM may end it.
+        cmd = ["sudo", "-n", "sh", "-c",
+               f'trap "" INT; exec {shlex.quote(zeek_bin)} -i {shlex.quote(args.iface)}']
     print(f"{C_META}[*] Starting Zeek: {' '.join(cmd)}{C_RESET}")
-    # Zeek must NOT be able to write to (or reconfigure) our terminal: all
-    # of its stdio is redirected — stdin/stdout discarded, stderr captured
-    # to a log file. `sudo -n` can never stop to prompt, so it never touches
-    # termios either. We deliberately stay in our session: macOS sudo binds
-    # credential tickets to the controlling tty, and a detached (setsid)
-    # capture couldn't see the ticket validated by `sudo -v` above.
+    # All of Zeek's stdio is redirected (stdin/stdout discarded, stderr to a
+    # log file), so the capture can never write to or reconfigure our
+    # terminal. It stays in our foreground process group because macOS sudo
+    # binds credential tickets to the controlling tty — a detached capture
+    # couldn't reuse the ticket validated by `sudo -v` above. The INT trap in
+    # cmd keeps a shared Ctrl+C from killing Zeek directly.
     console_path = os.path.join(work_dir, "zeek-console.log")
     try:
         proc = subprocess.Popen(cmd, cwd=work_dir, stdin=subprocess.DEVNULL,
@@ -1012,11 +1017,16 @@ def stop_zeek(proc, used_sudo):
 
     for cmd in kill_cmds:
         try:
-            subprocess.run(cmd, timeout=10)
+            # Long enough to actually type the sudo password at the prompt;
+            # the old 10s timeout gave up before most users could react.
+            subprocess.run(cmd, timeout=60)
             proc.wait(timeout=5)
             return
         except Exception:
             continue
+    safe_print(f"{C_NOTICE}[!] Couldn't stop Zeek (pid {proc.pid}) — sudo failed. "
+               f"Capture may still be running; stop it manually with:{C_RESET}")
+    safe_print(f"{C_NOTICE}    sudo pkill -9 zeek{C_RESET}")
 
 
 # --- CLI & entry point ---
