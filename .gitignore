@@ -15,5 +15,6 @@ ssh.log
 x509.log
 analyzer.log
 packet_filter.log
+wirewatch-tuning.zeek
 site/wirewatch.py
 site/install.sh

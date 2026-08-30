@@ -53,6 +53,15 @@ C_DOMAIN  = "\033[1;93m"      # Bold Yellow
 C_META    = "\033[96m"        # Cyan — lifecycle/info messages
 C_RESET   = "\033[0m"
 
+# --- Human-readable Zeek connection states ---
+CONN_STATE_LABELS = {
+    "S0": "no reply", "S1": "established", "SF": "normal close",
+    "REJ": "rejected", "S2": "resp→orig only", "S3": "orig→resp only",
+    "RSTO": "reset(orig)", "RSTR": "reset(resp)",
+    "RSTOS0": "reset(no resp)", "RSTRH": "reset(half)",
+    "SH": "half-open", "SHR": "half-open(resp)", "OTH": "midstream",
+}
+
 CN_RE = re.compile(r"CN=([^,]+)")
 
 socket.setdefaulttimeout(0.3)
@@ -108,9 +117,40 @@ MIN_BYTES = 0        # CONN rows below this total byte count are hidden
 MIN_DURATION = 0.0   # CONN rows shorter than this many seconds are hidden
 HIDE_LAN = False     # suppress unnamed local-network traffic
 
+# --- Watchlist (--watchlist) ---
+WATCHLIST_DOMAINS = set()
+WATCHLIST_IPS = set()
+WATCHLIST_CIDRS = []
+WATCHLIST_LOADED = False
+
+# --- Alert-on pattern (--alert-on) ---
+ALERT_PATTERN = None  # compiled regex, applied to every printed line
+
+# --- Periodic stats (--stats-interval) ---
+STATS_INTERVAL = 0  # seconds between summary lines, 0 = disabled
+
+# --- Session tracking (for exit summary) ---
+SESSION_START = 0.0
+SESSION_STATS = defaultdict(int)       # log_type -> event count
+SESSION_BYTES_IN = 0
+SESSION_BYTES_OUT = 0
+SESSION_STATS_LOCK = threading.Lock()
+UNIQUE_REMOTE_HOSTS = set()
+UNIQUE_HOSTS_LOCK = threading.Lock()
+TOP_DESTINATIONS = defaultdict(lambda: {"conns": 0, "bytes": 0})
+TOP_DEST_LOCK = threading.Lock()
+
+# --- Beaconing detection ---
+BEACON_TIMESTAMPS = defaultdict(list)   # (src, dst, port) -> [wall-clock ts]
+BEACON_LOCK = threading.Lock()
+BEACON_ALERTED = set()                  # keys already flagged this session
+BEACON_MIN_CONNS = 10                   # minimum sample size before checking
+BEACON_MAX_COV = 0.15                   # coefficient-of-variation threshold
+
 
 def apply_display_filters(args):
     global MATCH_TEXT, MIN_BYTES, MIN_DURATION, HIDE_LAN
+    global ALERT_PATTERN, STATS_INTERVAL
     if args.match:
         MATCH_TEXT = args.match
     try:
@@ -122,6 +162,15 @@ def apply_display_filters(args):
     except (TypeError, ValueError):
         MIN_DURATION = 0.0
     HIDE_LAN = bool(args.hide_lan)
+    if getattr(args, 'alert_on', None):
+        try:
+            ALERT_PATTERN = re.compile(args.alert_on, re.IGNORECASE)
+        except re.error as e:
+            print(f"{C_NOTICE}[!] Invalid --alert-on pattern: {e}{C_RESET}")
+    try:
+        STATS_INTERVAL = int(getattr(args, 'stats_interval', 0) or 0)
+    except (TypeError, ValueError):
+        STATS_INTERVAL = 0
 
 
 def is_unnamed_local(ip_str):
@@ -134,6 +183,142 @@ def is_unnamed_local(ip_str):
     if not (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast):
         return False
     return cache_get(ip_str) is None
+
+
+# --- Watchlist loading & matching ---
+
+def load_watchlist(filepath):
+    """Load domains, IPs, and CIDRs from a newline-delimited text file.
+    Lines starting with # are comments.  Entries can be:
+      - bare domains (example.com) — also matches *.example.com
+      - wildcard domains (*.evil.com) — same as bare
+      - IP addresses (1.2.3.4)
+      - CIDR ranges (185.220.0.0/16)
+    """
+    global WATCHLIST_LOADED
+    if not filepath:
+        return
+    try:
+        with open(filepath, "r") as f:
+            for raw in f:
+                entry = raw.strip()
+                if not entry or entry.startswith("#"):
+                    continue
+                if "/" in entry:
+                    try:
+                        WATCHLIST_CIDRS.append(ipaddress.ip_network(entry, strict=False))
+                        continue
+                    except ValueError:
+                        pass
+                try:
+                    ipaddress.ip_address(entry)
+                    WATCHLIST_IPS.add(entry)
+                    continue
+                except ValueError:
+                    pass
+                WATCHLIST_DOMAINS.add(entry.lower().lstrip("*."))
+        WATCHLIST_LOADED = True
+        total = len(WATCHLIST_DOMAINS) + len(WATCHLIST_IPS) + len(WATCHLIST_CIDRS)
+        safe_print(f"{C_META}[*] Watchlist loaded: {total} entries from {filepath}{C_RESET}")
+    except OSError as e:
+        print(f"{C_NOTICE}[!] Could not load watchlist: {e}{C_RESET}")
+
+
+def check_watchlist(value):
+    """True if value (an IP or domain string) matches any watchlist entry."""
+    if not WATCHLIST_LOADED or not value or value == "-":
+        return False
+    # IP check
+    try:
+        ip = ipaddress.ip_address(value)
+        if value in WATCHLIST_IPS:
+            return True
+        for net in WATCHLIST_CIDRS:
+            if ip in net:
+                return True
+    except ValueError:
+        pass
+    # Domain check (suffix match)
+    domain = value.lower()
+    for wd in WATCHLIST_DOMAINS:
+        if domain == wd or domain.endswith("." + wd):
+            return True
+    return False
+
+
+# --- Session statistics helpers ---
+
+def record_stat(log_type):
+    with SESSION_STATS_LOCK:
+        SESSION_STATS[log_type] += 1
+
+
+def record_bytes(orig, resp):
+    global SESSION_BYTES_OUT, SESSION_BYTES_IN
+    with SESSION_STATS_LOCK:
+        SESSION_BYTES_OUT += orig
+        SESSION_BYTES_IN += resp
+
+
+def record_remote_host(ip_str):
+    if not ip_str or ip_str == "-":
+        return
+    try:
+        ip = ipaddress.ip_address(ip_str)
+        if not (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast):
+            with UNIQUE_HOSTS_LOCK:
+                UNIQUE_REMOTE_HOSTS.add(ip_str)
+    except ValueError:
+        pass
+
+
+def record_destination(domain, byte_count):
+    if not domain or domain in ("-", "LAN/Local"):
+        return
+    with TOP_DEST_LOCK:
+        TOP_DESTINATIONS[domain]["conns"] += 1
+        TOP_DESTINATIONS[domain]["bytes"] += byte_count
+
+
+# --- Beaconing detection ---
+
+def check_beaconing(src, dst, port):
+    """Track connection timing and flag suspiciously regular intervals.
+    Only alerts once per (src, dst, port) tuple per session."""
+    key = (src, dst, port)
+    now = time.time()
+    with BEACON_LOCK:
+        ts_list = BEACON_TIMESTAMPS[key]
+        ts_list.append(now)
+        # Keep only the last 60 entries to bound memory
+        if len(ts_list) > 60:
+            BEACON_TIMESTAMPS[key] = ts_list[-60:]
+            ts_list = BEACON_TIMESTAMPS[key]
+        if len(ts_list) < BEACON_MIN_CONNS or key in BEACON_ALERTED:
+            return
+    # Compute outside the lock to avoid holding it during math
+    intervals = [ts_list[i + 1] - ts_list[i] for i in range(len(ts_list) - 1)]
+    if not intervals:
+        return
+    mean = sum(intervals) / len(intervals)
+    if mean < 1.0:  # sub-second bursts are normal
+        return
+    variance = sum((x - mean) ** 2 for x in intervals) / len(intervals)
+    std_dev = variance ** 0.5
+    cov = std_dev / mean if mean > 0 else float("inf")
+    if cov < BEACON_MAX_COV:
+        with BEACON_LOCK:
+            if key in BEACON_ALERTED:
+                return  # another thread got here first
+            BEACON_ALERTED.add(key)
+        domain = resolve_target(dst)
+        ts_str = time.strftime("%H:%M:%S", time.localtime(now))
+        window = int(ts_list[-1] - ts_list[0])
+        safe_print(
+            f"{C_TIME}{ts_str}{C_RESET} {C_NOTICE} [BEACON?] {C_RESET} "
+            f"{src} -> {dst}:{port} ({C_DOMAIN}{domain}{C_RESET}) — "
+            f"{len(ts_list)} conns in {window}s, interval ~{mean:.0f}s ±{std_dev:.0f}s"
+        )
 
 
 # --- DNS/SNI resolution cache (bounded, LRU) ---
@@ -304,10 +489,23 @@ def emit(log_type, msg):
     """Filtered print for parsed log rows: --only/--exclude gate visibility
     here instead of in process_row, so every row still reaches its parser
     and enrichment caches keep filling under any filter."""
+    record_stat(log_type)
     if MATCH_TEXT is not None and MATCH_TEXT.lower() not in ANSI_RE.sub("", msg).lower():
         return
-    if type_allowed(log_type):
-        safe_print(msg)
+    if not type_allowed(log_type):
+        return
+    # Watchlist / alert-on prefixing
+    plain = ANSI_RE.sub("", msg)
+    prefix = ""
+    if WATCHLIST_LOADED:
+        for token in plain.split():
+            cleaned = token.strip("()[]{},:/<>")
+            if check_watchlist(cleaned):
+                prefix = f"{C_NOTICE} [WATCH] {C_RESET} "
+                break
+    if not prefix and ALERT_PATTERN and ALERT_PATTERN.search(plain):
+        prefix = f"{C_DPD}[!]{C_RESET} "
+    safe_print(prefix + msg)
 
 
 # --- Dropped/malformed line tracking ---
@@ -638,6 +836,109 @@ def parse_files(row):
     ts = get_time(row.get("ts"))
     emit("files", f"{C_TIME}{ts}{C_RESET} {C_FILES}[FILES ]{C_RESET} {C_META}{source:<5}{C_RESET} {label:<45} {size_str}")
 
+
+def parse_smtp(row):
+    orig_h = row.get("id.orig_h", "-")
+    resp_h = row.get("id.resp_h", "-")
+    mailfrom = row.get("mailfrom", row.get("from", "-"))
+    rcptto = row.get("rcptto", row.get("to", "-"))
+    subject = row.get("subject", "-")
+    tls = row.get("tls", "-")
+    helo = row.get("helo", "-")
+    domain = resolve_target(resp_h)
+    tls_badge = f"{C_CONN}TLS{C_RESET}" if tls == "T" else f"{C_WEIRD}plain{C_RESET}"
+    ts = get_time(row.get("ts"))
+    subj_str = f" | Subj: {subject[:40]}" if subject and subject != "-" else ""
+    emit("smtp", f"{C_TIME}{ts}{C_RESET} {C_HTTP}[SMTP  ]{C_RESET} {orig_h:<15} -> {resp_h} ({C_DOMAIN}{domain}{C_RESET}) [{tls_badge}] From: {mailfrom} To: {rcptto}{subj_str}")
+
+
+def parse_ftp(row):
+    orig_h = row.get("id.orig_h", "-")
+    resp_h = row.get("id.resp_h", "-")
+    user = row.get("user", "-")
+    command = row.get("command", "-")
+    arg = row.get("arg", "-")
+    reply_code = row.get("reply_code", "-")
+    domain = resolve_target(resp_h)
+    ts = get_time(row.get("ts"))
+    arg_str = f" {arg[:50]}" if arg and arg != "-" else ""
+    emit("ftp", f"{C_TIME}{ts}{C_RESET} {C_HTTP}[FTP   ]{C_RESET} {orig_h:<15} -> {resp_h} ({C_DOMAIN}{domain}{C_RESET}) | User: {user} | {command}{arg_str} [{reply_code}]")
+
+
+def parse_smb_files(row):
+    orig_h = row.get("id.orig_h", "-")
+    resp_h = row.get("id.resp_h", "-")
+    action = row.get("action", "-")
+    name = row.get("name", "-")
+    path = row.get("path", "-")
+    size = row.get("size", "-")
+    domain = resolve_target(resp_h)
+    size_str = format_bytes(size)
+    ts = get_time(row.get("ts"))
+    file_path = f"{path}\\{name}" if path != "-" and name != "-" else (name if name != "-" else path)
+    emit("smb_files", f"{C_TIME}{ts}{C_RESET} {C_DPD}[SMB-F ]{C_RESET} {orig_h:<15} -> {resp_h} ({C_DOMAIN}{domain}{C_RESET}) | {action} {file_path[:50]} ({size_str})")
+
+
+def parse_smb_mapping(row):
+    orig_h = row.get("id.orig_h", "-")
+    resp_h = row.get("id.resp_h", "-")
+    path = row.get("path", "-")
+    share_type = row.get("share_type", "-")
+    native_file_system = row.get("native_file_system", "-")
+    domain = resolve_target(resp_h)
+    ts = get_time(row.get("ts"))
+    emit("smb_mapping", f"{C_TIME}{ts}{C_RESET} {C_DPD}[SMB-M ]{C_RESET} {orig_h:<15} -> {resp_h} ({C_DOMAIN}{domain}{C_RESET}) | Share: {path} [{share_type}] FS: {native_file_system}")
+
+
+def parse_rdp(row):
+    orig_h = row.get("id.orig_h", "-")
+    resp_h = row.get("id.resp_h", "-")
+    resp_p = row.get("id.resp_p", "3389")
+    cookie = row.get("cookie", "-")
+    security_protocol = row.get("security_protocol", "-")
+    cert_subject = row.get("cert.subject", row.get("subject", "-"))
+    result = row.get("result", "-")
+    domain = resolve_target(resp_h)
+    ts = get_time(row.get("ts"))
+    cookie_str = f" | Cookie: {cookie}" if cookie and cookie != "-" else ""
+    result_str = f" | Result: {result}" if result and result != "-" else ""
+    emit("rdp", f"{C_TIME}{ts}{C_RESET} {C_SSH}[RDP   ]{C_RESET} {orig_h:<15} -> {resp_h}:{resp_p} ({C_DOMAIN}{domain}{C_RESET}) [{security_protocol}]{cookie_str}{result_str}")
+
+
+def parse_tunnel(row):
+    orig_h = row.get("id.orig_h", "-")
+    resp_h = row.get("id.resp_h", "-")
+    tunnel_type = row.get("tunnel_type", "-")
+    action = row.get("action", "-")
+    domain = resolve_target(resp_h)
+    ts = get_time(row.get("ts"))
+    emit("tunnel", f"{C_TIME}{ts}{C_RESET} {C_QUIC}[TUNNEL]{C_RESET} {orig_h:<15} -> {resp_h} ({C_DOMAIN}{domain}{C_RESET}) | {tunnel_type} [{action}]")
+
+
+def parse_radius(row):
+    orig_h = row.get("id.orig_h", "-")
+    resp_h = row.get("id.resp_h", "-")
+    username = row.get("username", "-")
+    result = row.get("result", "-")
+    mac = row.get("mac", "-")
+    domain = resolve_target(resp_h)
+    ts = get_time(row.get("ts"))
+    result_badge = f"{C_CONN}OK{C_RESET}" if result == "success" else (f"{C_NOTICE}FAIL{C_RESET}" if result == "failed" else result)
+    emit("radius", f"{C_TIME}{ts}{C_RESET} {C_DHCP}[RADIUS]{C_RESET} {orig_h:<15} -> {resp_h} ({C_DOMAIN}{domain}{C_RESET}) | User: {username} | {result_badge} | MAC: {mac}")
+
+
+def parse_sip(row):
+    orig_h = row.get("id.orig_h", "-")
+    resp_h = row.get("id.resp_h", "-")
+    method = row.get("method", "-")
+    uri = row.get("uri", "-")
+    status_code = row.get("status_code", "-")
+    request_from = row.get("request_from", row.get("from", "-"))
+    domain = resolve_target(resp_h)
+    ts = get_time(row.get("ts"))
+    emit("sip", f"{C_TIME}{ts}{C_RESET} {C_NTP}[SIP   ]{C_RESET} {orig_h:<15} -> {resp_h} ({C_DOMAIN}{domain}{C_RESET}) | {method} {uri[:40]} [{status_code}] From: {request_from}")
+
+
 # Repeated identical CONN events (same proto + destination) within this
 # window are folded into the next line's "+N more" note instead of
 # flooding the terminal (mDNS/keepalive chatter). Same accepted trade-off
@@ -687,14 +988,21 @@ def parse_conn(row):
         _conn_state[key] = {"start": now, "count": 1}
 
     domain = resolve_target(resp_h)
+    record_remote_host(resp_h)
+    record_bytes(int(row.get("orig_bytes", "0") if row.get("orig_bytes", "-") != "-" else "0"),
+                 int(row.get("resp_bytes", "0") if row.get("resp_bytes", "-") != "-" else "0"))
+    record_destination(domain, total_bytes)
+    check_beaconing(orig_h, resp_h, resp_p)
     ts = get_time(row.get("ts"))
     src = f"{orig_h}:{orig_p}"
     dst = f"{resp_h}:{resp_p}"
     svc = service if service != "-" else resp_p
     dur_str = f"{float(duration):.2f}s" if duration != "-" else "-"
+    state_label = CONN_STATE_LABELS.get(state, "")
+    state_disp = f"{state}({state_label})" if state_label else state
     repeat_note = (f" {C_TIME}(+{prior_count - 1} more suppressed in prior {int(CONN_DEDUP_WINDOW)}s){C_RESET}"
                    if prior_count > 1 else "")
-    emit("conn", f"{C_TIME}{ts}{C_RESET} {C_CONN}[CONN  ]{C_RESET} {proto:<4} {src:<21} -> {dst:<21} ({C_DOMAIN}{domain:<30}{C_RESET}) [{C_META}{svc:<5}{C_RESET}] {state:<5} {dur_str}{repeat_note}")
+    emit("conn", f"{C_TIME}{ts}{C_RESET} {C_CONN}[CONN  ]{C_RESET} {proto:<4} {src:<21} -> {dst:<21} ({C_DOMAIN}{domain:<30}{C_RESET}) [{C_META}{svc:<5}{C_RESET}] {state_disp:<18} {dur_str}{repeat_note}")
 
 
 def parse_generic(log_type, row):
@@ -754,6 +1062,14 @@ def process_row(log_type, row):
     elif "known" in log_type: parse_known_generic(log_type, row)
     elif log_type == "notice": parse_notice(row)
     elif log_type == "files": parse_files(row)
+    elif log_type == "smtp": parse_smtp(row)
+    elif log_type == "ftp": parse_ftp(row)
+    elif log_type == "smb_files": parse_smb_files(row)
+    elif log_type == "smb_mapping": parse_smb_mapping(row)
+    elif log_type == "rdp": parse_rdp(row)
+    elif log_type == "tunnel": parse_tunnel(row)
+    elif log_type == "radius": parse_radius(row)
+    elif log_type == "sip": parse_sip(row)
     elif log_type == "conn": parse_conn(row)
     else: parse_generic(log_type, row)
 
@@ -952,6 +1268,18 @@ def launch_zeek(args, work_dir):
     # Resolve the absolute path once: `sudo` scrubs PATH down to its own
     # secure_path, which misses Homebrew cells and Ubuntu's /opt/zeek/bin.
     zeek_bin = shutil.which("zeek")
+
+    # Zeek buffers log writes by default (Log::flush_interval) which can delay
+    # output by seconds to minutes depending on traffic volume.  Write a small
+    # tuning script that flushes every 0.1 s for near-real-time tailing.
+    tuning_path = os.path.join(work_dir, "wirewatch-tuning.zeek")
+    try:
+        with open(tuning_path, "w") as tf:
+            tf.write("# Auto-generated by Wirewatch — safe to delete.\n")
+            tf.write("redef Log::flush_interval = 0.1 secs;\n")
+    except OSError:
+        tuning_path = None  # non-fatal — Zeek still works, just with its default lag
+
     if args.pcap:
         cmd = [zeek_bin, "-r", args.pcap]
     else:
@@ -973,6 +1301,10 @@ def launch_zeek(args, work_dir):
             print(f"{C_NOTICE}[!] Sudo authentication failed or was cancelled. Aborting.{C_RESET}")
             return None
         cmd = ["sudo", "-n", zeek_bin, "-i", args.iface]
+        if getattr(args, 'save_pcap', None):
+            cmd.extend(["-w", os.path.abspath(args.save_pcap)])
+    if tuning_path:
+        cmd.append(tuning_path)
     print(f"{C_META}[*] Starting Zeek: {' '.join(cmd)}{C_RESET}")
     # All of Zeek's stdio is redirected (stdin/stdout discarded, stderr to a
     # log file), so the capture can never write to or reconfigure our
@@ -1031,6 +1363,151 @@ def stop_zeek(proc, used_sudo):
     safe_print(f"{C_NOTICE}    sudo pkill -9 zeek{C_RESET}")
 
 
+# --- Startup info, session summary, periodic stats ---
+
+def get_interface_info(iface):
+    """Best-effort local IP and description for the capture interface."""
+    ip_addr = "?"
+    desc = ""
+    try:
+        if platform.system() == "Darwin":
+            out = subprocess.run(["ifconfig", iface], capture_output=True, text=True, timeout=3)
+            for line in out.stdout.splitlines():
+                line = line.strip()
+                if line.startswith("inet ") and "127.0.0.1" not in line:
+                    ip_addr = line.split()[1]
+                    break
+            # Try to get the interface type from networksetup
+            try:
+                ns = subprocess.run(["networksetup", "-listallhardwareports"],
+                                   capture_output=True, text=True, timeout=3)
+                lines = ns.stdout.splitlines()
+                for i, l in enumerate(lines):
+                    if f"Device: {iface}" in l and i > 0:
+                        desc = lines[i - 1].replace("Hardware Port: ", "")
+                        break
+            except Exception:
+                pass
+        else:  # Linux
+            out = subprocess.run(["ip", "-4", "addr", "show", iface],
+                                capture_output=True, text=True, timeout=3)
+            for line in out.stdout.splitlines():
+                line = line.strip()
+                if line.startswith("inet "):
+                    ip_addr = line.split()[1].split("/")[0]
+                    break
+    except Exception:
+        pass
+    return ip_addr, desc
+
+
+def flush_dedup_state():
+    """Emit any remaining suppressed counts from dedup windows at exit."""
+    with _weird_lock:
+        for key, st in _weird_state.items():
+            if st["count"] > 1:
+                safe_print(f"{C_TIME}[~]{C_RESET} {C_WEIRD}[WEIRD ]{C_RESET} "
+                           f"{key[0]} -> {key[1]}: +{st['count'] - 1} more suppressed at exit")
+    with _conn_lock:
+        for key, st in _conn_state.items():
+            if st["count"] > 1:
+                proto, resp_h, resp_p = key
+                domain = resolve_target(resp_h)
+                safe_print(f"{C_TIME}[~]{C_RESET} {C_CONN}[CONN  ]{C_RESET} "
+                           f"{proto} -> {resp_h}:{resp_p} ({C_DOMAIN}{domain}{C_RESET}): "
+                           f"+{st['count'] - 1} more suppressed at exit")
+
+
+def print_session_summary():
+    """Print a compact session summary on exit."""
+    elapsed = time.time() - SESSION_START
+    if elapsed < 1:
+        return
+    mins, secs = divmod(int(elapsed), 60)
+    hrs, mins = divmod(mins, 60)
+    if hrs:
+        dur_str = f"{hrs}h {mins}m {secs}s"
+    elif mins:
+        dur_str = f"{mins}m {secs}s"
+    else:
+        dur_str = f"{secs}s"
+
+    with SESSION_STATS_LOCK:
+        stats = dict(SESSION_STATS)
+        bytes_in = SESSION_BYTES_IN
+        bytes_out = SESSION_BYTES_OUT
+    with UNIQUE_HOSTS_LOCK:
+        n_remote = len(UNIQUE_REMOTE_HOSTS)
+
+    total_events = sum(stats.values())
+    if total_events == 0:
+        return
+
+    safe_print(f"")
+    safe_print(f"{C_CONN}=== Session Summary ({dur_str}) ==={C_RESET}")
+    safe_print(f"{C_META}  Unique remote hosts:  {C_RESET}{n_remote}")
+
+    # Top destinations
+    with TOP_DEST_LOCK:
+        sorted_dests = sorted(TOP_DESTINATIONS.items(), key=lambda x: x[1]["bytes"], reverse=True)[:5]
+    if sorted_dests:
+        parts = [f"{d} ({e['conns']} conns)" for d, e in sorted_dests]
+        safe_print(f"{C_META}  Top destinations:    {C_RESET}{', '.join(parts)}")
+
+    # Protocol breakdown
+    proto_parts = [f"{k.upper()}({v})" for k, v in sorted(stats.items(), key=lambda x: -x[1]) if v > 0]
+    if proto_parts:
+        safe_print(f"{C_META}  Events by type:      {C_RESET}{', '.join(proto_parts[:10])}")
+
+    # Data volume
+    safe_print(f"{C_META}  Data volume:         {C_RESET}{format_bytes(str(bytes_out))} sent, {format_bytes(str(bytes_in))} received")
+
+    # Alerts & weird
+    notice_count = stats.get("notice", 0)
+    weird_count = stats.get("weird", 0)
+    if notice_count:
+        safe_print(f"{C_META}  Alerts/Notices:      {C_RESET}{C_NOTICE}{notice_count}{C_RESET}")
+    if weird_count:
+        safe_print(f"{C_META}  Weird events:        {C_RESET}{weird_count}")
+
+    # Beaconing alerts
+    with BEACON_LOCK:
+        n_beacons = len(BEACON_ALERTED)
+    if n_beacons:
+        safe_print(f"{C_META}  Beaconing suspects:  {C_RESET}{C_NOTICE}{n_beacons}{C_RESET}")
+
+    safe_print(f"")
+
+
+def periodic_stats_worker():
+    """Background thread: emits a one-line summary every STATS_INTERVAL seconds."""
+    last_stats = defaultdict(int)
+    last_bytes_in = 0
+    last_bytes_out = 0
+    while True:
+        time.sleep(STATS_INTERVAL)
+        with SESSION_STATS_LOCK:
+            current = dict(SESSION_STATS)
+            cur_in = SESSION_BYTES_IN
+            cur_out = SESSION_BYTES_OUT
+        # Compute deltas
+        delta = {k: current.get(k, 0) - last_stats.get(k, 0) for k in current}
+        d_in = cur_in - last_bytes_in
+        d_out = cur_out - last_bytes_out
+        last_stats = current.copy()
+        last_bytes_in = cur_in
+        last_bytes_out = cur_out
+        total_delta = sum(delta.values())
+        if total_delta == 0:
+            continue
+        parts = [f"{k}:{v}" for k, v in sorted(delta.items(), key=lambda x: -x[1]) if v > 0][:6]
+        safe_print(
+            f"{C_META}--- {STATS_INTERVAL}s: {total_delta} events | "
+            f"{' | '.join(parts)} | "
+            f"{format_bytes(str(d_out))} out, {format_bytes(str(d_in))} in ---{C_RESET}"
+        )
+
+
 # --- CLI & entry point ---
 
 def parse_args():
@@ -1055,6 +1532,14 @@ def parse_args():
                    help="Hide CONN rows shorter than S seconds")
     p.add_argument("--hide-lan", action="store_true",
                    help="Suppress unnamed LAN/mDNS/local traffic")
+    p.add_argument("--watchlist", metavar="FILE",
+                   help="Newline-delimited file of domains, IPs, and CIDRs to flag with [WATCH]")
+    p.add_argument("--alert-on", metavar="PATTERN",
+                   help="Regex pattern — matching lines get a [!] highlight prefix (doesn't filter)")
+    p.add_argument("--stats-interval", type=int, default=0, metavar="SEC",
+                   help="Print a one-line event/traffic summary every SEC seconds (0 = disabled)")
+    p.add_argument("--save-pcap", metavar="FILE",
+                   help="Also save raw packets to this pcap file (adds -w to Zeek)")
     return p.parse_args()
 
 
@@ -1076,6 +1561,10 @@ def main():
     configure_colors(resolve_color_setting(args.no_color))
     apply_filters(args.only, args.exclude)
     apply_display_filters(args)
+    global SESSION_START
+    SESSION_START = time.time()
+    if getattr(args, 'watchlist', None):
+        load_watchlist(args.watchlist)
 
     work_dir = os.path.abspath(os.path.expanduser(args.dir))
     os.makedirs(work_dir, exist_ok=True)
@@ -1094,8 +1583,16 @@ def main():
     print(f"\n{C_CONN}=== Wirewatch — Zeek Omni-Monitor ==={C_RESET}")
     safe_print(f"{C_META}Watching directory: {work_dir}{C_RESET}")
     if zeek_proc is not None:
-        label = f"pcap {args.pcap}" if args.pcap else f"interface {args.iface}"
-        print(f"{C_CONN}[+] Zeek capture started (pid {zeek_proc.pid}, {label}){C_RESET}\n")
+        if args.pcap:
+            label = f"pcap {args.pcap}"
+        else:
+            ip_addr, iface_desc = get_interface_info(args.iface)
+            desc_str = f", {iface_desc}" if iface_desc else ""
+            label = f"interface {args.iface}{desc_str}, {ip_addr}"
+        print(f"{C_CONN}[+] Zeek capture started (pid {zeek_proc.pid}, {label}){C_RESET}")
+        if getattr(args, 'save_pcap', None):
+            print(f"{C_CONN}[+] Also saving raw packets to: {args.save_pcap}{C_RESET}")
+        print()
     else:
         print(f"{C_META}[i] Attach-only mode — expecting Zeek logs to appear in this directory.{C_RESET}\n")
 
@@ -1105,6 +1602,10 @@ def main():
 
     watcher_thread = threading.Thread(target=log_watcher, daemon=True)
     watcher_thread.start()
+
+    if STATS_INTERVAL > 0:
+        stats_thread = threading.Thread(target=periodic_stats_worker, daemon=True)
+        stats_thread.start()
 
     try:
         while True:
@@ -1123,7 +1624,9 @@ def main():
     finally:
         if zeek_proc is not None and zeek_proc.poll() is None:
             stop_zeek(zeek_proc, used_sudo)
+        flush_dedup_state()
         print_dropped_summary()
+        print_session_summary()
         print(f"{C_META}Exiting Wirewatch.{C_RESET}")
 
 
