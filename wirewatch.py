@@ -1619,15 +1619,50 @@ def periodic_stats_worker():
         )
 
 
+def detect_default_interface():
+    """Auto-detect active default network interface on macOS and Linux."""
+    system = platform.system()
+    if system == "Darwin":
+        try:
+            out = subprocess.run(["route", "-n", "get", "default"], capture_output=True, text=True, timeout=2)
+            for line in out.stdout.splitlines():
+                if "interface:" in line:
+                    return line.split(":")[1].strip()
+        except Exception:
+            pass
+        return "en0"
+    elif system == "Linux":
+        try:
+            out = subprocess.run(["ip", "route", "show", "default"], capture_output=True, text=True, timeout=2)
+            words = out.stdout.split()
+            if "dev" in words:
+                idx = words.index("dev")
+                if idx + 1 < len(words):
+                    return words[idx + 1]
+        except Exception:
+            pass
+        if os.path.exists("/sys/class/net"):
+            try:
+                for iface in sorted(os.listdir("/sys/class/net")):
+                    if iface != "lo" and not any(iface.startswith(p) for p in ("docker", "br-", "veth", "virbr")):
+                        return iface
+            except Exception:
+                pass
+        return "eth0"
+    return "en0" if system == "Darwin" else "eth0"
+
+
 # --- CLI & entry point ---
 
 def parse_args():
+    default_iface = detect_default_interface()
     p = argparse.ArgumentParser(
         prog="wirewatch",
         description="One-command Zeek network monitor: checks prerequisites, starts Zeek, "
                     "and streams enriched, color-coded protocol output.",
     )
-    p.add_argument("-i", "--iface", default="en0", help="Network interface to capture on (default: en0)")
+    p.add_argument("-i", "--iface", default=default_iface,
+                   help=f"Network interface to capture on (default: {default_iface})")
     p.add_argument("--dir", default=".", help="Directory to run Zeek in / watch for logs (default: current directory)")
     p.add_argument("--only", help="Comma-separated log types to show exclusively, e.g. dns,http,ssl")
     p.add_argument("--exclude", help="Comma-separated log types to hide, e.g. ntp,dhcp")
