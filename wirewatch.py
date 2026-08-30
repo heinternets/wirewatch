@@ -1206,53 +1206,105 @@ def log_watcher():
 
 
 # --- Prerequisites & Zeek process management ---
+ZEEK_MODE = "native"  # "native" or "docker"
+DOCKER_CONTAINER_NAME = None
+
 
 def ensure_zeek(no_install=False):
+    global ZEEK_MODE
+    # 1. Check if native zeek is already available on PATH or in /opt
     if shutil.which("zeek"):
+        ZEEK_MODE = "native"
         return True
+    for candidate in ["/opt/zeek/bin/zeek", "/opt/zeek-8.0/bin/zeek", "/usr/local/zeek/bin/zeek"]:
+        if os.path.exists(candidate):
+            os.environ["PATH"] = os.path.dirname(candidate) + ":" + os.environ.get("PATH", "")
+            ZEEK_MODE = "native"
+            return True
+
+    # 2. Check if docker is available
+    docker_bin = shutil.which("docker")
+    system = platform.system()
+    arch = platform.machine().lower()
+
     if no_install:
-        print(f"{C_NOTICE}[!] Zeek not found on PATH (--no-install set).{C_RESET}")
+        if docker_bin:
+            ZEEK_MODE = "docker"
+            return True
+        print(f"{C_NOTICE}[!] Zeek not found on PATH and no Docker available (--no-install set).{C_RESET}")
         return False
 
-    system = platform.system()
     if system == "Darwin":
         if not shutil.which("brew"):
             print(f"{C_NOTICE}[!] Zeek not found, and Homebrew isn't installed.{C_RESET}")
             print(f"    Install Homebrew first: {C_DOMAIN}https://brew.sh{C_RESET}, then re-run this script.")
             return False
         print(f"{C_META}[*] Zeek not found — installing with 'brew install zeek' (this can take a few minutes)...{C_RESET}")
-        install_cmd = ["brew", "install", "zeek"]
-    elif system == "Linux" and shutil.which("apt-get"):
-        print(f"{C_META}[*] Zeek not found — installing with 'apt-get install zeek' (this can take a few minutes)...{C_RESET}")
-        prefix = [] if os.geteuid() == 0 else ["sudo"]
-        install_cmd = prefix + ["apt-get", "install", "-y", "zeek"]
-    else:
-        print(f"{C_NOTICE}[!] Zeek not found on PATH.{C_RESET} Automatic install currently supports "
-              f"macOS (Homebrew) and Debian-family Linux (apt).")
-        print(f"    See {C_DOMAIN}https://zeek.org/get-zeek/{C_RESET} for install instructions, then re-run.")
-        return False
+        try:
+            subprocess.run(["brew", "install", "zeek"], check=True)
+            if shutil.which("zeek"):
+                ZEEK_MODE = "native"
+                print(f"{C_CONN}[+] Zeek installed successfully.{C_RESET}")
+                return True
+        except subprocess.CalledProcessError:
+            print(f"{C_NOTICE}[!] Homebrew installation of Zeek failed.{C_RESET}")
+            return False
 
-    try:
-        subprocess.run(install_cmd, check=True)
-    except subprocess.CalledProcessError:
-        print(f"{C_NOTICE}[!] Zeek installation failed. Zeek is not in Ubuntu's own archives —{C_RESET}")
-        print(f"    run the Wirewatch installer ({C_DOMAIN}https://wirewatch.net{C_RESET}), which wires up")
-        print(f"    the official package repo (amd64) or the Docker image (arm64), or see")
-        print(f"    {C_DOMAIN}https://zeek.org/get-zeek/{C_RESET}.")
-        return False
+    elif system == "Linux":
+        # Check architecture: OBS repo only provides amd64 / x86_64 packages
+        if arch in ("x86_64", "amd64") and shutil.which("apt-get"):
+            print(f"{C_META}[*] Zeek not found — configuring official Zeek repository...{C_RESET}")
+            prefix = [] if os.geteuid() == 0 else ["sudo"]
+            try:
+                dist = "xUbuntu_22.04"
+                if os.path.exists("/etc/os-release"):
+                    with open("/etc/os-release") as f:
+                        for line in f:
+                            if line.startswith("ID="):
+                                dist_id = line.split("=", 1)[1].strip().strip('"')
+                            elif line.startswith("VERSION_ID="):
+                                version_id = line.split("=", 1)[1].strip().strip('"')
+                    if dist_id in ("ubuntu", "pop"):
+                        dist = f"xUbuntu_{version_id}"
+                    elif dist_id == "debian":
+                        dist = f"Debian_{version_id.split('.')[0]}"
+                repo_url = f"https://download.opensuse.org/repositories/security:/zeek/{dist}/"
+                subprocess.run(prefix + ["apt-get", "update", "-y"], check=True)
+                subprocess.run(prefix + ["apt-get", "install", "-y", "curl", "gnupg", "ca-certificates"], check=True)
+                subprocess.run(f"curl -fsSL https://download.opensuse.org/repositories/security:zeek/{dist}/Release.key | gpg --dearmor | {' '.join(prefix)} tee /etc/apt/trusted.gpg.d/security_zeek.gpg > /dev/null", shell=True, check=True)
+                subprocess.run(f'echo "deb {repo_url} /" | {" ".join(prefix)} tee /etc/apt/sources.list.d/security:zeek.list > /dev/null', shell=True, check=True)
+                subprocess.run(prefix + ["apt-get", "update", "-y"], check=True)
+                subprocess.run(prefix + ["apt-get", "install", "-y", "zeek-8.0"], check=True)
+                for candidate in ["/opt/zeek/bin/zeek", "/opt/zeek-8.0/bin/zeek"]:
+                    if os.path.exists(candidate):
+                        os.environ["PATH"] = os.path.dirname(candidate) + ":" + os.environ.get("PATH", "")
+                        ZEEK_MODE = "native"
+                        print(f"{C_CONN}[+] Zeek installed successfully.{C_RESET}")
+                        return True
+            except Exception as e:
+                print(f"{C_WEIRD}[!] Native Zeek installation failed ({e}). Falling back to Docker...{C_RESET}")
 
-    # Debian/Ubuntu package Zeek under /opt/zeek/bin, wired into PATH only
-    # for new login shells — extend it for this process.
-    if not shutil.which("zeek") and os.path.exists("/opt/zeek/bin/zeek"):
-        os.environ["PATH"] = "/opt/zeek/bin:" + os.environ.get("PATH", "")
+        # ARM64 or Docker fallback
+        if not docker_bin and shutil.which("apt-get"):
+            print(f"{C_META}[*] Installing Docker (docker.io) for containerized Zeek...{C_RESET}")
+            prefix = [] if os.geteuid() == 0 else ["sudo"]
+            try:
+                subprocess.run(prefix + ["apt-get", "update", "-y"], check=True)
+                subprocess.run(prefix + ["apt-get", "install", "-y", "docker.io"], check=True)
+                subprocess.run(prefix + ["systemctl", "start", "docker"], check=False)
+                docker_bin = shutil.which("docker")
+            except Exception as e:
+                print(f"{C_NOTICE}[!] Docker installation failed: {e}{C_RESET}")
 
-    if not shutil.which("zeek"):
-        print(f"{C_NOTICE}[!] Installation reported success but 'zeek' still isn't on PATH "
-              f"(you may need to restart your shell).{C_RESET}")
-        return False
+        if docker_bin:
+            ZEEK_MODE = "docker"
+            print(f"{C_CONN}[+] Using Docker for Zeek capture (zeek/zeek:lts).{C_RESET}")
+            return True
 
-    print(f"{C_CONN}[+] Zeek installed successfully.{C_RESET}")
-    return True
+    print(f"{C_NOTICE}[!] Zeek is not available and could not be installed automatically.{C_RESET}")
+    print(f"    On ARM64 Linux, install Docker: {C_DOMAIN}sudo apt-get install -y docker.io{C_RESET}")
+    print(f"    See {C_DOMAIN}https://zeek.org/get-zeek/{C_RESET} for manual installation instructions.")
+    return False
 
 
 def interface_looks_valid(iface):
@@ -1265,9 +1317,7 @@ def interface_looks_valid(iface):
         return True  # don't block startup on an uncertain check
 
 def launch_zeek(args, work_dir):
-    # Resolve the absolute path once: `sudo` scrubs PATH down to its own
-    # secure_path, which misses Homebrew cells and Ubuntu's /opt/zeek/bin.
-    zeek_bin = shutil.which("zeek")
+    global DOCKER_CONTAINER_NAME
 
     # Zeek buffers log writes by default (Log::flush_interval) which can delay
     # output by seconds to minutes depending on traffic volume.  Write a small
@@ -1280,48 +1330,106 @@ def launch_zeek(args, work_dir):
     except OSError:
         tuning_path = None  # non-fatal — Zeek still works, just with its default lag
 
-    if args.pcap:
-        cmd = [zeek_bin, "-r", args.pcap]
+    if ZEEK_MODE == "docker":
+        DOCKER_CONTAINER_NAME = f"wirewatch-zeek-{os.getpid()}"
+
+        needs_sudo = False
+        if os.geteuid() != 0:
+            test = subprocess.run(["docker", "info"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if test.returncode != 0:
+                needs_sudo = True
+
+        prefix = []
+        if needs_sudo:
+            print(f"{C_META}[*] Checking sudo access for Docker capture "
+                  f"(you may be prompted for your password)...{C_RESET}")
+            try:
+                subprocess.run(["sudo", "-v"], timeout=120)
+            except subprocess.TimeoutExpired:
+                print(f"{C_NOTICE}[!] Timed out waiting for your sudo password.{C_RESET}")
+                return None
+            if subprocess.run(["sudo", "-n", "true"]).returncode != 0:
+                print(f"{C_NOTICE}[!] Sudo authentication failed or was cancelled. Aborting.{C_RESET}")
+                return None
+            prefix = ["sudo", "-n"]
+
+        # Remove any preexisting container with the same name
+        subprocess.run(prefix + ["docker", "rm", "-f", DOCKER_CONTAINER_NAME],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        cmd = prefix + [
+            "docker", "run", "--rm",
+            "--name", DOCKER_CONTAINER_NAME,
+            "--net=host",
+            "--cap-add=NET_RAW",
+            "--cap-add=NET_ADMIN",
+            "-v", f"{work_dir}:/workdir",
+            "-w", "/workdir",
+            "zeek/zeek:lts",
+            "zeek"
+        ]
+
+        if args.pcap:
+            pcap_abs = os.path.abspath(args.pcap)
+            pcap_dir = os.path.dirname(pcap_abs)
+            pcap_name = os.path.basename(pcap_abs)
+            if pcap_dir != work_dir:
+                cmd = prefix + [
+                    "docker", "run", "--rm",
+                    "--name", DOCKER_CONTAINER_NAME,
+                    "-v", f"{work_dir}:/workdir",
+                    "-v", f"{pcap_dir}:/pcap_mount:ro",
+                    "-w", "/workdir",
+                    "zeek/zeek:lts",
+                    "zeek", "-r", f"/pcap_mount/{pcap_name}"
+                ]
+            else:
+                cmd.extend(["-r", pcap_name])
+        else:
+            if not interface_looks_valid(args.iface):
+                print(f"{C_WEIRD}[!] Interface '{args.iface}' wasn't found on this system — "
+                      f"continuing anyway, Zeek will report an error if it's wrong.{C_RESET}")
+            cmd.extend(["-i", args.iface])
+            if getattr(args, 'save_pcap', None):
+                cmd.extend(["-w", os.path.basename(args.save_pcap)])
+
+        if tuning_path:
+            cmd.append("wirewatch-tuning.zeek")
+
     else:
-        if not interface_looks_valid(args.iface):
-            print(f"{C_WEIRD}[!] Interface '{args.iface}' wasn't found on this system — "
-                  f"continuing anyway, Zeek will report an error if it's wrong.{C_RESET}")
-        # Refresh sudo credentials up front with a short-lived interactive
-        # `sudo -v`. The capture itself then starts non-interactively and —
-        # critically — in its own session (setsid), so the zeek/sudo pair
-        # has NO controlling terminal and cannot touch ours mid-run.
-        print(f"{C_META}[*] Checking sudo access for packet capture "
-              f"(you may be prompted for your password)...{C_RESET}")
-        try:
-            subprocess.run(["sudo", "-v"], timeout=120)
-        except subprocess.TimeoutExpired:
-            print(f"{C_NOTICE}[!] Timed out waiting for your sudo password.{C_RESET}")
-            return None
-        if subprocess.run(["sudo", "-n", "true"]).returncode != 0:
-            print(f"{C_NOTICE}[!] Sudo authentication failed or was cancelled. Aborting.{C_RESET}")
-            return None
-        cmd = ["sudo", "-n", zeek_bin, "-i", args.iface]
-        if getattr(args, 'save_pcap', None):
-            cmd.extend(["-w", os.path.abspath(args.save_pcap)])
-    if tuning_path:
-        cmd.append(tuning_path)
+        zeek_bin = shutil.which("zeek")
+        if args.pcap:
+            cmd = [zeek_bin, "-r", args.pcap]
+        else:
+            if not interface_looks_valid(args.iface):
+                print(f"{C_WEIRD}[!] Interface '{args.iface}' wasn't found on this system — "
+                      f"continuing anyway, Zeek will report an error if it's wrong.{C_RESET}")
+            print(f"{C_META}[*] Checking sudo access for packet capture "
+                  f"(you may be prompted for your password)...{C_RESET}")
+            try:
+                subprocess.run(["sudo", "-v"], timeout=120)
+            except subprocess.TimeoutExpired:
+                print(f"{C_NOTICE}[!] Timed out waiting for your sudo password.{C_RESET}")
+                return None
+            if subprocess.run(["sudo", "-n", "true"]).returncode != 0:
+                print(f"{C_NOTICE}[!] Sudo authentication failed or was cancelled. Aborting.{C_RESET}")
+                return None
+            cmd = ["sudo", "-n", zeek_bin, "-i", args.iface]
+            if getattr(args, 'save_pcap', None):
+                cmd.extend(["-w", os.path.abspath(args.save_pcap)])
+        if tuning_path:
+            cmd.append(tuning_path)
+
     print(f"{C_META}[*] Starting Zeek: {' '.join(cmd)}{C_RESET}")
-    # All of Zeek's stdio is redirected (stdin/stdout discarded, stderr to a
-    # log file), so the capture can never write to or reconfigure our
-    # terminal. It stays in our foreground process group because macOS sudo
-    # binds credential tickets to the controlling tty — a detached capture
-    # couldn't reuse the ticket validated by `sudo -v` above. Ctrl+C reaching
-    # Zeek through the shared group is intentional: it ends capture instantly,
-    # and stop_zeek skips sudo entirely when Zeek is already gone.
     console_path = os.path.join(work_dir, "zeek-console.log")
     try:
         proc = subprocess.Popen(cmd, cwd=work_dir, stdin=subprocess.DEVNULL,
                                 stdout=subprocess.DEVNULL,
                                 stderr=open(console_path, "w"))
-    except FileNotFoundError:
-        print(f"{C_NOTICE}[!] Couldn't find 'zeek' on PATH. Aborting.{C_RESET}")
+    except FileNotFoundError as e:
+        print(f"{C_NOTICE}[!] Failed to execute Zeek command: {e}. Aborting.{C_RESET}")
         return None
-    time.sleep(1.5)  # let a bad interface / failed sudo auth fail fast
+    time.sleep(2.0)  # let a bad interface / failed sudo auth fail fast
     rc = proc.poll()
     if rc is not None:
         if args.pcap:
@@ -1331,15 +1439,21 @@ def launch_zeek(args, work_dir):
                   f"See zeek-console.log for Zeek's output.{C_RESET}")
         else:
             print(f"{C_NOTICE}[!] Zeek exited immediately (code {rc}). "
-                  f"Check the interface name and sudo access — see zeek-console.log for details.{C_RESET}")
+                  f"Check the interface name, Docker/sudo access — see zeek-console.log for details.{C_RESET}")
         return None
     return proc
 
 
 def stop_zeek(proc, used_sudo):
-    # The shared foreground group means a terminal Ctrl+C usually already
-    # terminated Zeek (and its sudo wrapper) — skip the password-asking
-    # kill path entirely when nothing is left to stop.
+    global DOCKER_CONTAINER_NAME
+    if DOCKER_CONTAINER_NAME:
+        print(f"{C_META}[*] Stopping Zeek container ({DOCKER_CONTAINER_NAME})...{C_RESET}")
+        subprocess.run(["docker", "rm", "-f", DOCKER_CONTAINER_NAME],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if used_sudo:
+            subprocess.run(["sudo", "docker", "rm", "-f", DOCKER_CONTAINER_NAME],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
     if proc.poll() is not None:
         return
     if used_sudo:
@@ -1351,15 +1465,12 @@ def stop_zeek(proc, used_sudo):
 
     for cmd in kill_cmds:
         try:
-            # Long enough to actually type the sudo password at the prompt;
-            # the old 10s timeout gave up before most users could react.
-            subprocess.run(cmd, timeout=60)
+            subprocess.run(cmd, timeout=30)
             proc.wait(timeout=5)
             return
         except Exception:
             continue
-    safe_print(f"{C_NOTICE}[!] Couldn't stop Zeek (pid {proc.pid}) — sudo failed. "
-               f"Capture may still be running; stop it manually with:{C_RESET}")
+    safe_print(f"{C_NOTICE}[!] Couldn't stop Zeek (pid {proc.pid}) cleanly.{C_RESET}")
     safe_print(f"{C_NOTICE}    sudo pkill -9 zeek{C_RESET}")
 
 
