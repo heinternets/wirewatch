@@ -47,30 +47,39 @@ your sudo password a second time to do that, unless it's still cached from step 
 ```
 python3 wirewatch.py [options]
 
-  -i, --iface IFACE   Network interface to capture on (default: en0)
-  --dir DIR           Directory to run Zeek in / watch for logs (default: current directory)
-  --only TYPES         Comma-separated log types to show exclusively, e.g. dns,http,ssl
+  -i, --iface IFACE     Network interface to capture on (default: auto-detected active interface)
+  --dir DIR             Directory to run Zeek in / watch for logs (default: current directory)
+  --only TYPES          Comma-separated log types to show exclusively, e.g. dns,http,ssl
   --exclude TYPES       Comma-separated log types to hide, e.g. ntp,dhcp
   --no-color            Disable ANSI colors (auto-disabled anyway when output isn't a terminal,
                         or when the NO_COLOR env var is set)
   --pcap FILE           Read from a pcap file instead of a live capture (no sudo needed)
   --attach-only         Don't launch Zeek — just watch --dir for logs from a Zeek process you
-                        started yourself (this was the old default behavior)
-  --no-install          Don't try to auto-install Zeek if it's missing
-  --match TEXT         Only show lines containing this substring (case-insensitive)
-  --min-bytes N        Hide CONN rows with fewer than N bytes transferred (orig+resp)
-  --min-duration S     Hide CONN rows shorter than S seconds
-  --hide-lan           Suppress unnamed LAN/mDNS/local traffic
+                        started yourself
+  --no-install          Don't auto-install Zeek if it's missing
+  --match TEXT          Only show lines containing this substring (case-insensitive)
+  --min-bytes N         Hide CONN rows with fewer than N bytes transferred (orig+resp)
+  --min-duration S      Hide CONN rows shorter than S seconds
+  --hide-lan            Suppress unnamed LAN/mDNS/local traffic
+  --watchlist FILE      Newline-delimited file of domains, IPs, and CIDRs to flag with [WATCH]
+  --alert-on PATTERN    Regex pattern — matching lines get a [!] highlight prefix (doesn't filter)
+  --stats-interval SEC  Print a one-line event/traffic summary every SEC seconds (0 = disabled)
+  --save-pcap FILE      Also save raw packets to this pcap file (adds -w to Zeek)
 ```
 
 Examples:
 
 ```
-python3 wirewatch.py -i en1                     # capture on a different interface
-python3 wirewatch.py --only dns,http,ssl        # just web + DNS traffic
-python3 wirewatch.py --exclude ntp,dhcp         # hide the noisy background chatter
-python3 wirewatch.py --pcap sample.pcap         # analyze a capture file, no sudo required
-python3 wirewatch.py --attach-only --dir ~/logs # tail logs from an existing zeekctl deployment
+python3 wirewatch.py                              # capture on default active interface
+python3 wirewatch.py -i eth0                      # capture on a specific interface
+python3 wirewatch.py --only dns,http,ssl          # just web + DNS traffic
+python3 wirewatch.py --exclude ntp,dhcp           # hide the noisy background chatter
+python3 wirewatch.py --watchlist iocs.txt         # highlight matches against a threat list
+python3 wirewatch.py --alert-on "ssh|rdp|3389"   # highlight suspicious traffic with [!]
+python3 wirewatch.py --stats-interval 30         # periodic 30-second traffic summary
+python3 wirewatch.py --save-pcap capture.pcap     # save raw packets while monitoring live
+python3 wirewatch.py --pcap sample.pcap           # analyze a capture file, no sudo required
+python3 wirewatch.py --attach-only --dir ~/logs   # tail logs from an existing zeekctl deployment
 python3 wirewatch.py --match example.com          # only lines mentioning a domain
 python3 wirewatch.py --hide-lan --min-bytes 10000 # real remote traffic only
 ```
