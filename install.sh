@@ -6,16 +6,26 @@
 #   curl -fsSL https://wirewatch.net/install.sh | bash
 #
 # What it does:
-#   1. Detects the OS (macOS / Debian-family Linux).
-#   2. Installs prerequisites: Homebrew + Zeek + python3 (macOS) or
+#   1. Creates a 'wirewatch' directory and enters it (so all files stay contained).
+#   2. Detects the OS (macOS / Debian-family Linux).
+#   3. Installs prerequisites: Homebrew + Zeek + python3 (macOS) or
 #      apt + Zeek + python3 (Ubuntu/Debian).
-#   3. Downloads the latest wirewatch.py from this site.
-#   4. Detects the active network interface and starts Wirewatch on it.
+#   4. Downloads the latest wirewatch.py from this site into that directory.
+#   5. Detects the active network interface and starts Wirewatch on it.
 #
 set -euo pipefail
 
 BASE_URL="${WIREWATCH_BASE_URL:-https://wirewatch.net}"
-INSTALL_DIR="${WIREWATCH_DIR:-$HOME/.wirewatch}"
+
+# Create wirewatch directory first and cd into it so all downloads and Zeek logs stay contained
+TARGET_DIR="${WIREWATCH_DIR:-wirewatch}"
+if [ "$TARGET_DIR" = "wirewatch" ] && [ "$(basename "$PWD")" = "wirewatch" ]; then
+    INSTALL_DIR="$(pwd)"
+else
+    mkdir -p "$TARGET_DIR"
+    cd "$TARGET_DIR"
+    INSTALL_DIR="$(pwd)"
+fi
 
 log()  { printf '\033[96m[*]\033[0m %s\n' "$*"; }
 ok()   { printf '\033[1;32m[+]\033[0m %s\n' "$*"; }
@@ -103,8 +113,12 @@ install_prereqs_apt() {
             curl -fsSL "https://download.opensuse.org/repositories/security:zeek/${dist}/Release.key" \
                 | gpg --dearmor | $SUDO tee /etc/apt/trusted.gpg.d/security_zeek.gpg > /dev/null
             $SUDO apt-get update -y
-            log "Installing prerequisites: zeek-8.0, python3..."
-            $SUDO apt-get install -y zeek-8.0 python3 ca-certificates curl
+            log "Installing prerequisites: Zeek (LTS), python3..."
+            if ! $SUDO apt-get install -y zeek-lts python3 ca-certificates curl 2>/dev/null; then
+                if ! $SUDO apt-get install -y zeek-9.0 python3 ca-certificates curl 2>/dev/null; then
+                    $SUDO apt-get install -y zeek-8.0 python3 ca-certificates curl
+                fi
+            fi
             # OBS packages install under /opt/zeek, on PATH only for new shells.
             if ! command -v zeek >/dev/null; then
                 for d in /opt/zeek*/bin; do

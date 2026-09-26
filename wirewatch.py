@@ -608,8 +608,12 @@ def parse_ssl(row):
         if cn:
             server_disp = f"cert:{cn}"
 
+    ech_suffix = ""
+    if row.get("ech_kdf_id", "-") != "-" or row.get("ech_aead_id", "-") != "-":
+        ech_suffix = " ECH"
+
     ts = get_time(row.get("ts"))
-    emit("ssl", f"{C_TIME}{ts}{C_RESET} {C_SSL}[SSL/TLS]{C_RESET} {orig_h:<15} -> {resp_h}:{resp_p} ({C_DOMAIN}{server_disp:<30}{C_RESET}) [{C_META}{version}{C_RESET}]")
+    emit("ssl", f"{C_TIME}{ts}{C_RESET} {C_SSL}[SSL/TLS]{C_RESET} {orig_h:<15} -> {resp_h}:{resp_p} ({C_DOMAIN}{server_disp:<30}{C_RESET}) [{C_META}{version}{ech_suffix}{C_RESET}]")
 
 
 def parse_http(row):
@@ -685,16 +689,28 @@ def parse_weird(row):
                    if prior_count > 1 else "")
     emit("weird", f"{C_TIME}{ts}{C_RESET} {C_WEIRD}[WEIRD ]{C_RESET} {src_info} -> {dst_info} | {C_WEIRD}{name}{C_RESET}{detail}{repeat_note}")
 
-def parse_ntp(row):
+def parse_ntp(row, log_type="ntp"):
     orig_h = row.get("id.orig_h", "-")
     resp_h = row.get("id.resp_h", "-")
     version = row.get("version", "-")
     mode = row.get("mode", "-")
     stratum = row.get("stratum", "-")
 
+    if log_type == "ntp_control":
+        badge = "NTP-CTRL"
+        op = row.get("op_code", "-")
+        extra = f"v{version} Mode:6 OpCode:{op}"
+    elif log_type == "ntp_private":
+        badge = "NTP-PRIV"
+        req = row.get("request_code", "-")
+        extra = f"v{version} Mode:7 ReqCode:{req}"
+    else:
+        badge = "NTP   "
+        extra = f"v{version} Stratum:{stratum} Mode:{mode}"
+
     domain = resolve_target(resp_h)
     ts = get_time(row.get("ts"))
-    emit("ntp", f"{C_TIME}{ts}{C_RESET} {C_NTP}[NTP   ]{C_RESET} {orig_h:<15} -> {resp_h:<15} ({C_DOMAIN}{domain:<28}{C_RESET}) [v{version} Stratum:{stratum} Mode:{mode}]")
+    emit("ntp", f"{C_TIME}{ts}{C_RESET} {C_NTP}[{badge:<8}]{C_RESET} {orig_h:<15} -> {resp_h:<15} ({C_DOMAIN}{domain:<28}{C_RESET}) [{extra}]")
 
 def parse_ssh(row):
     orig_h = row.get("id.orig_h", "-")
@@ -939,6 +955,17 @@ def parse_sip(row):
     emit("sip", f"{C_TIME}{ts}{C_RESET} {C_NTP}[SIP   ]{C_RESET} {orig_h:<15} -> {resp_h} ({C_DOMAIN}{domain}{C_RESET}) | {method} {uri[:40]} [{status_code}] From: {request_from}")
 
 
+def parse_multicast_participants(row):
+    orig_h = row.get("orig_h", "-")
+    group_addr = row.get("group_addr", "-")
+    group_p = row.get("group_p", "")
+    participants = row.get("participants", "-")
+    target = f"{group_addr}:{group_p}" if group_p and group_p != "-" else group_addr
+    domain = resolve_target(group_addr)
+    ts = get_time(row.get("ts"))
+    emit("conn", f"{C_TIME}{ts}{C_RESET} {C_KNOWN}[MCAST ]{C_RESET} {orig_h:<15} -> {target:<21} ({C_DOMAIN}{domain:<28}{C_RESET}) [Members: {participants}]")
+
+
 # Repeated identical CONN events (same proto + destination) within this
 # window are folded into the next line's "+N more" note instead of
 # flooding the terminal (mDNS/keepalive chatter). Same accepted trade-off
@@ -1035,6 +1062,8 @@ HIDE_LAN_DST_FIELDS = {
     "conn": "id.resp_h",
     "weird": "id.resp_h",
     "ntp": "id.resp_h",
+    "ntp_control": "id.resp_h",
+    "ntp_private": "id.resp_h",
     "ssh": "id.resp_h",
     "dpd": "id.resp_h",
     "notice": "dst",
@@ -1050,7 +1079,7 @@ def process_row(log_type, row):
     elif log_type == "http": parse_http(row)
     elif log_type == "quic": parse_quic(row)
     elif log_type == "weird": parse_weird(row)
-    elif log_type == "ntp": parse_ntp(row)
+    elif log_type in ("ntp", "ntp_control", "ntp_private"): parse_ntp(row, log_type)
     elif log_type == "ssh": parse_ssh(row)
     elif log_type == "dhcp": parse_dhcp(row)
     elif log_type == "software": parse_software(row)
@@ -1070,6 +1099,7 @@ def process_row(log_type, row):
     elif log_type == "tunnel": parse_tunnel(row)
     elif log_type == "radius": parse_radius(row)
     elif log_type == "sip": parse_sip(row)
+    elif log_type == "multicast_participants": parse_multicast_participants(row)
     elif log_type == "conn": parse_conn(row)
     else: parse_generic(log_type, row)
 
@@ -1216,7 +1246,7 @@ def ensure_zeek(no_install=False):
     if shutil.which("zeek"):
         ZEEK_MODE = "native"
         return True
-    for candidate in ["/opt/zeek/bin/zeek", "/opt/zeek-8.0/bin/zeek", "/usr/local/zeek/bin/zeek"]:
+    for candidate in ["/opt/zeek/bin/zeek", "/opt/zeek-9.0/bin/zeek", "/opt/zeek-8.0/bin/zeek", "/usr/local/zeek/bin/zeek"]:
         if os.path.exists(candidate):
             os.environ["PATH"] = os.path.dirname(candidate) + ":" + os.environ.get("PATH", "")
             ZEEK_MODE = "native"
@@ -1274,8 +1304,15 @@ def ensure_zeek(no_install=False):
                 subprocess.run(f"curl -fsSL https://download.opensuse.org/repositories/security:zeek/{dist}/Release.key | gpg --dearmor | {' '.join(prefix)} tee /etc/apt/trusted.gpg.d/security_zeek.gpg > /dev/null", shell=True, check=True)
                 subprocess.run(f'echo "deb {repo_url} /" | {" ".join(prefix)} tee /etc/apt/sources.list.d/security:zeek.list > /dev/null', shell=True, check=True)
                 subprocess.run(prefix + ["apt-get", "update", "-y"], check=True)
-                subprocess.run(prefix + ["apt-get", "install", "-y", "zeek-8.0"], check=True)
-                for candidate in ["/opt/zeek/bin/zeek", "/opt/zeek-8.0/bin/zeek"]:
+                pkg_cmd = prefix + ["apt-get", "install", "-y"]
+                installed = False
+                for pkg in ["zeek-lts", "zeek-9.0", "zeek-8.0"]:
+                    if subprocess.run(pkg_cmd + [pkg], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
+                        installed = True
+                        break
+                if not installed:
+                    subprocess.run(pkg_cmd + ["zeek"], check=True)
+                for candidate in ["/opt/zeek/bin/zeek", "/opt/zeek-9.0/bin/zeek", "/opt/zeek-8.0/bin/zeek"]:
                     if os.path.exists(candidate):
                         os.environ["PATH"] = os.path.dirname(candidate) + ":" + os.environ.get("PATH", "")
                         ZEEK_MODE = "native"
@@ -1308,6 +1345,8 @@ def ensure_zeek(no_install=False):
 
 
 def interface_looks_valid(iface):
+    if iface.startswith(("udp::", "af_packet::")):
+        return True
     try:
         if platform.system() == "Darwin":
             out = subprocess.run(["ifconfig", "-l"], capture_output=True, text=True, timeout=3)

@@ -13,8 +13,9 @@ curl -fsSL https://wirewatch.net/install.sh | bash
 ```
 
 That one command detects your OS, installs anything missing (Homebrew/apt,
-Python 3, Zeek), downloads the latest Wirewatch, detects your active network
-interface, and starts the capture.
+Python 3, Zeek), creates a `wirewatch` directory so all logs and capture files
+stay cleanly contained, downloads the latest Wirewatch, detects your active
+network interface, and starts the capture.
 
 Or run from source:
 
