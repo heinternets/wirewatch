@@ -1,147 +1,153 @@
-# Wirewatch — Zeek Omni-Monitor
+# Wirewatch
 
-A real-time, enriched, color-coded output monitor for Zeek, for macOS and Linux.
+**Real-time, human-readable network intelligence in your terminal — powered by Zeek.**
 
-It cross-references DNS answers and TLS SNI names against every other log in real time, so
-raw IPs in `conn.log`, `weird.log`, `known_services.log`, etc. show up labeled with the domain
-that was actually seen talking to them — instead of a wall of bare IP addresses.
+Wirewatch turns Zeek's raw protocol logs into a single live, color-coded, cross-referenced stream on **macOS** and **Linux**. Instead of scrolling through walls of bare IP addresses, you immediately see **which local app** is talking, the **actual domain** behind shared CDN IPs, **first-seen destinations (`★ NEW`)**, **encrypted-DNS bypasses (`[No-DNS/DoH]`)**, and **traffic intent (`[AI]`, `[TELEM]`, `[OS/SYNC]`)**.
 
-## Quick start
+---
 
-```
+## Quick Start
+
+Run with a single command (detects macOS/Linux, installs Zeek if missing, auto-selects your active network interface, and starts monitoring):
+
+```bash
 curl -fsSL https://wirewatch.net/install.sh | bash
 ```
 
-That one command detects your OS, installs anything missing (Homebrew/apt,
-Python 3, Zeek), creates a `wirewatch` directory so all logs and capture files
-stay cleanly contained, downloads the latest Wirewatch, detects your active
-network interface, and starts the capture.
+Or run directly from source (zero Python dependencies — stdlib Python 3 only):
 
-Or run from source:
-
-```
+```bash
 python3 wirewatch.py
 ```
 
-From source, that one command:
-1. Checks for Zeek and installs it via Homebrew/apt if it's missing.
-2. Refreshes your sudo credentials (`sudo -v`, you'll be prompted for your password), then
-   starts `zeek -i en0` non-interactively with all of its output redirected away from your
-   terminal, so the capture can't interfere with the display.
-3. Starts tailing and enriching every `*.log` file Zeek produces.
+---
 
-Press `Ctrl+C` to stop — Wirewatch will stop the Zeek capture for you (you may be asked for
-your sudo password a second time to do that, unless it's still cached from step 2).
+## Live Terminal Output
 
-
-
-## Prerequisites
-
-- None to speak of: `curl`, a terminal, and sudo access. The installer handles
-  Homebrew/apt, Python 3, and Zeek automatically on macOS and Debian-family Linux.
-- On other platforms, install Zeek yourself (see [zeek.org/get-zeek](https://zeek.org/get-zeek/))
-  and either run it manually and use `--attach-only` below, or open an issue if you'd like
-  native support for your platform.
-
-## Usage
-
+```text
+09:43:12 [DNS   ] Brave    ↗ :53      api.openai.com             [A   ] → 104.18.1.2, 104.18.2.2 (18ms) ★ NEW [AI]
+09:43:12 [DNS   ] Cursor   ↗ :53      events.data.microsoft.com  [AAAA] → 2620:1ec:c11::200 [slow:245ms] ★ NEW [TELEM]
+09:43:13 [DNS   ] mDNS     ↗ :5353    _companion-link._tcp.local [PTR ] → (PTR data) [Apple Continuity]
+09:43:13 [TLS   ] Cursor   ↗ :443     api.openai.com             [TLSv13] (Let's Encrypt) [AI] 104.18.1.2
+09:43:14 [TLS   ] Brave    ↗ :443     secret-blog.example.com    [TLSv13] [No-DNS/DoH] ★ NEW 104.18.1.2
+09:43:14 [TLS   ] curl     ↗ :443     cert:legacy.internal.corp  [TLSv11] [EXPIRED-CERT] [DIRECT-IP] 185.220.101.7
+09:43:15 [QUIC  ] Cursor   ↗ :443     events.data.microsoft.com  [h3] [TELEM] 2620:1ec..:200
+09:43:16 [CONN  ] Cursor   ↗ tcp/443  api.openai.com             ↑1.4KB  ↓47.1KB SF(ok)        4.2s [AI]
+09:43:18 [CONN  ] Brave    ↗ tcp/443  secret-blog.example.com    ↑2.5MB  ↓13.7KB SF(ok)        12.8s [↑ UPLOAD 2.5MB]
+09:43:19 [CONN  ] IN       ↙ tcp/22   45.33.32.156               0B              REJ(rejected) 0.0s [DIRECT-IP]
+━━━ MARK #1 at 09:43:20 (+8.0s: 10 events, ↑2.5MB ↓60.8KB) ━━━
 ```
+
+### Reading a Row
+
+Every protocol log is aligned to the same 5-column grid:
+
+| Column | Example | Meaning |
+| :--- | :--- | :--- |
+| **1. Time** | `09:43:14` | Event timestamp |
+| **2. Protocol** | `[TLS   ]` | Protocol / analyzer (`DNS`, `TLS`, `QUIC`, `HTTP`, `CONN`, `SSH`, `FILES`, `ALERT`, `WEIRD`) |
+| **3. App & Direction** | `Brave    ↗ :443` | Local process name + direction (`↗` outbound, `↙` unsolicited inbound, `→` LAN peer) |
+| **4. Target** | `secret-blog.example.com` | Authoritative domain name (preserving root TLD when truncated) or remote IP |
+| **5. Insights** | `[TLSv13] [No-DNS/DoH] ★ NEW` | Protocol telemetry, byte volumes (`↑sent ↓rcvd`), and automated insight badges |
+
+---
+
+## Key Insights & Features
+
+- **Local Process Attribution**: Maps active TCP/UDP sockets to the local application (`Brave`, `Cursor`, `Opera`, `Safari`, `curl`, `iCloud`) via fast non-blocking socket table scans (`netstat -anv` on macOS, `ss -tupn` on Linux).
+- **Per-Connection (`uid`) CDN Correlation**: Correlates `ssl.log`, `quic.log`, `http.log`, and `conn.log` using Zeek's connection `uid` first before falling back to IP caches — eliminating domain mix-ups when multiple sites share the same Cloudflare, Fastly, or Google anycast IP.
+- **DNS-Bypass (`[No-DNS/DoH]`) & Direct-IP (`[DIRECT-IP]`) Badges**:
+  - `[No-DNS/DoH]` flags TLS/QUIC connections whose SNI hostname was never preceded by a local plaintext DNS query (e.g. browser DNS-over-HTTPS or hardcoded resolvers).
+  - `[DIRECT-IP]` flags connections to public IPs with neither prior DNS resolution nor TLS SNI.
+- **First-Seen Domain Novelty (`★ NEW`)**: Persists seen registrable base domains across runs in `.wirewatch-known.json` and highlights brand-new destinations with `★ NEW`.
+- **Traffic Intent & Bonjour/mDNS Translation**: Badges `[AI]`, `[TELEM]`, and `[OS/SYNC]` endpoints and decodes cryptic local mDNS queries (`_companion-link._tcp.local` → `[Apple Continuity]`, `_airplay._tcp` → `[AirPlay]`, `_hap._tcp` → `[HomeKit]`).
+- **Transfer Volume & Upload Anomaly Detection**: Shows `↑sent ↓rcvd` byte counts on `[CONN]` rows, highlights failed connection states (`S0`, `REJ`, `RSTO`), and flags heavy outbound transfers (`[↑ UPLOAD 2.5MB]`).
+- **Smart Noise Folding**: Prioritizes resolved IPs ahead of CNAME chains in DNS answers, folds routine X.509 certificate chains into `[TLS]` (showing `(Let's Encrypt)` or alerting on `[EXPIRED-CERT]` / `[SELF-SIGNED]`), and deduplicates parallel browser socket bursts.
+
+---
+
+## Live Interactive Hotkeys
+
+Press single keys at any time during a live capture without stopping Zeek:
+
+| Key | Action | Description |
+| :---: | :--- | :--- |
+| `Space` / `p` | **Pause / Resume** | Freeze terminal scrolling to inspect lines; new events buffer in the background and flush on resume |
+| `Enter` / `m` | **Drop Bookmark** | Print a bright `━━━ MARK #N ━━━` divider with elapsed time, event count, and `↑sent ↓rcvd` byte deltas |
+| `s` | **Live Snapshot** | Print an on-demand summary of top destinations, active local apps, new domains, and categories |
+| `n` | **Toggle Only-New** | Filter live output on the fly to show only `★ NEW` domains, alerts, and anomalies |
+| `l` | **Toggle Hide-LAN** | Toggle suppression of unnamed local/LAN/mDNS chatter |
+| `?` / `h` | **Help** | Print the interactive hotkey bar |
+| `q` / `Ctrl+C` | **Quit** | Stop Zeek cleanly and print the full session summary |
+
+---
+
+## CLI Options
+
+```text
 python3 wirewatch.py [options]
 
-  -i, --iface IFACE     Network interface to capture on (default: auto-detected active interface)
+Capture & Input:
+  -i, --iface IFACE     Network interface to capture on (default: auto-detected active route)
   --dir DIR             Directory to run Zeek in / watch for logs (default: current directory)
-  --only TYPES          Comma-separated log types to show exclusively, e.g. dns,http,ssl
-  --exclude TYPES       Comma-separated log types to hide, e.g. ntp,dhcp
-  --no-color            Disable ANSI colors (auto-disabled anyway when output isn't a terminal,
-                        or when the NO_COLOR env var is set)
-  --pcap FILE           Read from a pcap file instead of a live capture (no sudo needed)
-  --attach-only         Don't launch Zeek — just watch --dir for logs from a Zeek process you
-                        started yourself
-  --no-install          Don't auto-install Zeek if it's missing
+  --pcap FILE           Read from a pcap file instead of live capture (no sudo needed)
+  --save-pcap FILE      Also save raw packets to this pcap file (adds -w to Zeek)
+  --attach-only         Watch --dir for logs from an already-running Zeek process
+  --no-install          Don't auto-install Zeek if missing
+
+Filtering & Display:
+  --only-new            Only show newly seen domains (★ NEW), alerts, weird events & heavy uploads
+  --hide-lan            Suppress unnamed LAN/mDNS/local traffic
+  --only TYPES          Comma-separated log types to show exclusively (e.g. dns,http,ssl,conn)
+  --exclude TYPES       Comma-separated log types to hide (e.g. ntp,dhcp)
   --match TEXT          Only show lines containing this substring (case-insensitive)
   --min-bytes N         Hide CONN rows with fewer than N bytes transferred (orig+resp)
   --min-duration S      Hide CONN rows shorter than S seconds
-  --hide-lan            Suppress unnamed LAN/mDNS/local traffic
+  --verbose             Show all raw x509 cert rows, SSL file entries, and parallel handshakes
+  --no-procs            Disable local process/app attribution lookup
+  --no-color            Disable ANSI colors (also respects NO_COLOR)
+
+Monitoring & Alerts:
   --watchlist FILE      Newline-delimited file of domains, IPs, and CIDRs to flag with [WATCH]
-  --alert-on PATTERN    Regex pattern — matching lines get a [!] highlight prefix (doesn't filter)
-  --stats-interval SEC  Print a one-line event/traffic summary every SEC seconds (0 = disabled)
-  --save-pcap FILE      Also save raw packets to this pcap file (adds -w to Zeek)
+  --alert-on PATTERN    Regex pattern — matching lines get a [!] highlight prefix
+  --stats-interval SEC  Print a periodic traffic summary line every SEC seconds
 ```
 
-Examples:
+### Common Examples
 
-```
-python3 wirewatch.py                              # capture on default active interface
-python3 wirewatch.py -i eth0                      # capture on a specific interface
-python3 wirewatch.py --only dns,http,ssl          # just web + DNS traffic
-python3 wirewatch.py --exclude ntp,dhcp           # hide the noisy background chatter
-python3 wirewatch.py --watchlist iocs.txt         # highlight matches against a threat list
-python3 wirewatch.py --alert-on "ssh|rdp|3389"   # highlight suspicious traffic with [!]
-python3 wirewatch.py --stats-interval 30         # periodic 30-second traffic summary
-python3 wirewatch.py --save-pcap capture.pcap     # save raw packets while monitoring live
-python3 wirewatch.py --pcap sample.pcap           # analyze a capture file, no sudo required
-python3 wirewatch.py --attach-only --dir ~/logs   # tail logs from an existing zeekctl deployment
-python3 wirewatch.py --match example.com          # only lines mentioning a domain
-python3 wirewatch.py --hide-lan --min-bytes 10000 # real remote traffic only
+```bash
+python3 wirewatch.py                              # Live capture on default active interface
+python3 wirewatch.py --only-new                   # Watch only first-seen domains, alerts & uploads
+python3 wirewatch.py --hide-lan --min-bytes 5000  # Focus on substantive external traffic
+python3 wirewatch.py --only dns,ssl,conn          # Web & connection activity only
+python3 wirewatch.py --pcap sample.pcap           # Analyze an existing pcap file (no sudo needed)
+python3 wirewatch.py --watchlist iocs.txt         # Highlight matches against a custom watchlist
 ```
 
-## Distribution & hosting notes
+---
 
-Wirewatch is distributed from [wirewatch.net](https://wirewatch.net), a static site on Azure
-Static Web Apps that serves `index.html`, `install.sh`, and `wirewatch.py` straight out of this
-repository (staged by `.github/workflows/deploy.yml` on every push to `main`). The scripts are
-always the latest committed version — no manual uploads.
+## Architecture & Hosting Notes
 
-Why the one-liner is `curl ... | bash` rather than `curl ... | python3`: piping an interpreter
-a script means its stdin is the network stream, not your terminal. The installer downloads
-`wirewatch.py` and runs it as a separate process with terminal stdin attached (`< /dev/tty`),
-while `sudo` — which always prompts on the controlling terminal, never on stdin — handles the
-password prompt itself. A global `exec 0</dev/tty` inside the installer is NOT an option:
-bash reads the piped script source from stdin, so redirecting fd 0 mid-script makes bash try
-to read the rest of the script from your keyboard (it hangs silently).
+- **Zero external Python dependencies**: `wirewatch.py` is a single self-contained Python 3 script using only the standard library.
+- **Terminal-safe Zeek execution**: Refreshes `sudo -v` credentials up front, then launches Zeek non-interactively (`sudo -n`) with its output redirected to `zeek-console.log` and a `0.1s` log flush interval (`wirewatch-tuning.zeek`).
+- **Static distribution**: Hosted on [wirewatch.net](https://wirewatch.net) (Azure Static Web Apps), serving `index.html`, `install.sh`, and `wirewatch.py` directly from `main`.
 
-### Deploying the site
+<details>
+<summary>Deploying <code>wirewatch.net</code> (Azure Static Web Apps)</summary>
 
 1. Push this repo to GitHub (`main` branch).
 2. Create the Static Web App (Free plan):
-
-```
-az group create -n rg-wirewatch -l eastus2
-az staticwebapp create -n wirewatch -g rg-wirewatch -s <org>/wirewatch -b main --sku Free
-```
-
-3. Add the deployment token as a repository secret if the app wasn't linked to the repo at
-   creation time:
-
-```
-az staticwebapp secrets list -n wirewatch -g rg-wirewatch \
-  --query "properties.apiKey" -o tsv | gh secret set AZURE_STATIC_WEB_APPS_API_TOKEN -R <org>/wirewatch
-```
-
-4. Point `wirewatch.net` at the app (Free plan allows 2 custom domains):
-
-```
-az staticwebapp hostname set -n wirewatch -g rg-wirewatch --hostname wirewatch.net
-```
-
-   then create the DNS record your registrar asks for (CNAME/ALIAS to the app's default
-   `<name>.azurestaticapps.net` hostname, or a TXT validation record for an apex domain).
-   TLS certificates are issued and renewed automatically.
-
-## What's new since the original version
-
-- Handles Zeek log rotation (reattaches automatically instead of going silent on a log type).
-- Bounded, background (non-blocking) reverse-DNS resolution — the terminal never stalls waiting
-  on a DNS lookup.
-- `known_services.log`, `known_certs.log`, and `known_hosts.log` each get a dedicated, more
-  useful format instead of being squeezed into one generic layout.
-- Repeated identical `weird.log` events are collapsed with a "+N more suppressed" note instead
-  of flooding the screen.
-- Malformed/short lines are counted and flagged instead of silently vanishing.
-- Every printed line is clamped to the terminal width (never soft-wraps), and mDNS/TXT
-  record payloads are dropped from `dns.log` output — you see the query name, not
-  hundreds of bytes of raw record data.
-- Zeek is launched non-interactively (`sudo -n`, credentials refreshed up front via `sudo -v`)
-  with all of its terminal streams redirected — it can neither write to your terminal nor
-  change its settings while the capture runs, which is what caused randomly indented lines
-  mid-session. Its stderr is captured to `zeek-console.log`.
+   ```bash
+   az group create -n rg-wirewatch -l eastus2
+   az staticwebapp create -n wirewatch -g rg-wirewatch -s <org>/wirewatch -b main --sku Free
+   ```
+3. Add the deployment token as a repository secret if not linked automatically:
+   ```bash
+   az staticwebapp secrets list -n wirewatch -g rg-wirewatch \
+     --query "properties.apiKey" -o tsv | gh secret set AZURE_STATIC_WEB_APPS_API_TOKEN -R <org>/wirewatch
+   ```
+4. Point `wirewatch.net` at the app:
+   ```bash
+   az staticwebapp hostname set -n wirewatch -g rg-wirewatch --hostname wirewatch.net
+   ```
+</details>

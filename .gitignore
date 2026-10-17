@@ -16,5 +16,8 @@ x509.log
 analyzer.log
 packet_filter.log
 wirewatch-tuning.zeek
+.wirewatch-known.json
+.DS_Store
 site/wirewatch.py
 site/install.sh
+
